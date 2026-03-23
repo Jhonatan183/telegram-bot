@@ -25,7 +25,11 @@ TIMEZONE = pytz.timezone("America/Bogota")
 DB_URL = os.getenv("DATABASE_URL")
 
 # ===== DB =====
-conn = psycopg2.connect(DB_URL, sslmode="require")
+import os
+
+DB_URL = os.getenv("DATABASE_URL")
+
+conn = psycopg2.connect(DB_URL)
 cursor = conn.cursor()
 
 cursor.execute("""
