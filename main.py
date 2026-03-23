@@ -75,7 +75,7 @@ async def botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             id, texto, chat_id, fecha = m
 
             kb = [[
-                InlineKeyboardButton("❌", callback_data=f"del_{id}")
+                InlineKeyboardButton("❌ Eliminar", callback_data=f"del_{id}")
             ]]
 
             await q.message.reply_text(
@@ -121,7 +121,7 @@ def main():
     app.add_handler(CallbackQueryHandler(eliminar_btn, pattern="del_"))
     app.add_handler(MessageHandler(filters.TEXT, recibir))
 
-    print("BOT OK 🔥")
+    print("BOT ENCENDIDO 🔥")
     app.run_polling()
 
 if __name__ == "__main__":
