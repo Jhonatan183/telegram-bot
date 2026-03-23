@@ -1,4 +1,3 @@
-import os
 import psycopg2
 from datetime import datetime
 import pytz
@@ -10,8 +9,8 @@ from telegram.ext import (
 )
 
 # ===== CONFIG =====
-TOKEN = os.getenv("TOKEN")
-DB_URL = os.getenv("DATABASE_URL")
+TOKEN = "8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJSU"
+DB_URL = "postgresql://postgres:CpSzcVpAJcFclBYIiwnMudwResayRISd@postgres.railway.internal:5432/railway"  # ← Railway lo reemplaza automáticamente
 
 ADMIN_ID = 5869414542
 
@@ -42,7 +41,7 @@ CREATE TABLE IF NOT EXISTS mensajes (
 """)
 conn.commit()
 
-# ===== FUNCIONES DB =====
+# ===== DB FUNCIONES =====
 def guardar(m):
     cursor.execute("""
     INSERT INTO mensajes (tipo, texto, file_id, chat_id, fecha)
@@ -69,11 +68,8 @@ async def enviar(context):
     job = context.job.data
     bot = context.bot
 
-    try:
-        if job["tipo"] == "texto":
-            await bot.send_message(job["chat_id"], job["texto"])
-    except Exception as e:
-        print("Error enviando:", e)
+    if job["tipo"] == "texto":
+        await bot.send_message(job["chat_id"], job["texto"])
 
 # ===== MENU =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -84,6 +80,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📅 Programar", callback_data="prog")],
         [InlineKeyboardButton("📋 Ver mensajes", callback_data="panel")]
     ]
+
     await update.message.reply_text("Panel PRO", reply_markup=InlineKeyboardMarkup(kb))
 
 # ===== PANEL =====
