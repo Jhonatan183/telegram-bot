@@ -16,11 +16,9 @@ TIMEZONE = pytz.timezone("America/Bogota")
 conn = psycopg2.connect(DB_URL)
 cursor = conn.cursor()
 
-cursor.execute("DROP TABLE IF EXISTS mensajes")
-conn.commit()
-
+# ✅ SOLO CREA SI NO EXISTE
 cursor.execute("""
-CREATE TABLE mensajes (
+CREATE TABLE IF NOT EXISTS mensajes (
     id SERIAL PRIMARY KEY,
     tipo TEXT,
     contenido TEXT,
