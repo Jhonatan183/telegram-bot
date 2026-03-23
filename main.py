@@ -1,6 +1,6 @@
 from telegram.ext import Updater, CommandHandler
 
-TOKEN = "8564451538:AAH8AUwKLiEbH8B9SkVtI0wlLCu510WpU9Q"
+TOKEN = "8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJ5U"
 
 def start(update, context):
     update.message.reply_text("🔥 BOT FUNCIONANDO")
