@@ -1,14 +1,9 @@
 import psycopg2
 from datetime import datetime
 import pytz
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters
-)
-
-# ===== CONFIG =====
 TOKEN = "8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJ5U"
 DB_URL = "postgresql://postgres:CpSzcVpAJcFclBYIiwnMudwResayRISd@postgres.railway.internal:5432/railway"
 
@@ -25,7 +20,6 @@ CANALES = [
 
 TIMEZONE = pytz.timezone("America/Bogota")
 
-# ===== DB =====
 conn = psycopg2.connect(DB_URL)
 cursor = conn.cursor()
 
@@ -39,7 +33,6 @@ CREATE TABLE IF NOT EXISTS mensajes (
 """)
 conn.commit()
 
-# ===== FUNCIONES =====
 def guardar(texto, chat_id, fecha):
     cursor.execute(
         "INSERT INTO mensajes (texto, chat_id, fecha) VALUES (%s,%s,%s)",
@@ -55,74 +48,71 @@ def eliminar(id):
     cursor.execute("DELETE FROM mensajes WHERE id=%s", (id,))
     conn.commit()
 
-# ===== MENU =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def start(update, context):
     kb = [
         [InlineKeyboardButton("📅 Programar", callback_data="prog")],
         [InlineKeyboardButton("📋 Ver", callback_data="ver")]
     ]
-    await update.message.reply_text("Panel", reply_markup=InlineKeyboardMarkup(kb))
+    update.message.reply_text("Panel", reply_markup=InlineKeyboardMarkup(kb))
 
-# ===== BOTONES =====
-async def botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+def botones(update, context):
+    query = update.callback_query
+    query.answer()
 
-    if q.data == "ver":
+    if query.data == "ver":
         datos = obtener()
 
         for m in datos:
             id, texto, chat_id, fecha = m
 
             kb = [[
-                InlineKeyboardButton("❌ Eliminar", callback_data=f"del_{id}")
+                InlineKeyboardButton("❌", callback_data=f"del_{id}")
             ]]
 
-            await q.message.reply_text(
+            query.message.reply_text(
                 f"{id} | {texto} | {fecha}",
                 reply_markup=InlineKeyboardMarkup(kb)
             )
 
-# ===== ELIMINAR =====
-async def eliminar_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+def eliminar_btn(update, context):
+    query = update.callback_query
+    query.answer()
 
-    id = int(q.data.split("_")[1])
+    id = int(query.data.split("_")[1])
     eliminar(id)
 
-    await q.message.reply_text("Eliminado")
+    query.message.reply_text("Eliminado")
 
-# ===== RECIBIR =====
-async def recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def recibir(update, context):
     try:
         texto, fecha = update.message.text.split("|")
-        fecha_dt = TIMEZONE.localize(datetime.strptime(fecha.strip(), "%Y-%m-%d %H:%M"))
+        fecha_dt = datetime.strptime(fecha.strip(), "%Y-%m-%d %H:%M")
 
         for canal in CANALES:
             guardar(texto.strip(), canal, fecha.strip())
 
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.send_message(canal, texto.strip()),
-                when=fecha_dt
+                when=(fecha_dt - datetime.now()).total_seconds()
             )
 
-        await update.message.reply_text("Programado")
+        update.message.reply_text("Programado")
 
     except:
-        await update.message.reply_text("Formato: texto | YYYY-MM-DD HH:MM")
+        update.message.reply_text("Formato: texto | YYYY-MM-DD HH:MM")
 
-# ===== MAIN =====
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(botones))
-    app.add_handler(CallbackQueryHandler(eliminar_btn, pattern="del_"))
-    app.add_handler(MessageHandler(filters.TEXT, recibir))
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CallbackQueryHandler(botones))
+    dp.add_handler(CallbackQueryHandler(eliminar_btn, pattern="del_"))
+    dp.add_handler(MessageHandler(Filters.text, recibir))
 
-    print("BOT ENCENDIDO 🔥")
-    app.run_polling()
+    print("BOT FUNCIONANDO 🔥")
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
