@@ -9,7 +9,7 @@ from telegram.ext import (
 )
 
 # ===== CONFIG =====
-TOKEN = "TU_TOKEN"
+TOKEN = "8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJ5U"
 ADMIN_ID = 5869414542
 
 CANALES = [
