@@ -5,20 +5,9 @@ import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
-# ===== CONFIG =====
 TOKEN = "8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJ5U"
-ADMIN_ID = 5869414542
-
 DB_URL = "postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@postgres.railway.internal:5432/railway"
-
-CANALES = [
-    -1001939817105,
-    -1002496825506,
-    -1001972632210,
-    -1002846744606,
-    -1002707167875,
-    -1002276974978,
-]
+ADMIN_ID = 5869414542
 
 TIMEZONE = pytz.timezone("America/Bogota")
 
@@ -29,99 +18,201 @@ cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS mensajes (
     id SERIAL PRIMARY KEY,
-    texto TEXT,
-    chat_id BIGINT,
+    tipo TEXT,
+    contenido TEXT,
+    file_id TEXT,
     fecha TEXT
 )
 """)
 conn.commit()
 
-# ===== FUNCIONES DB =====
-def guardar(texto, chat_id, fecha):
+# ===== DB FUNCIONES =====
+def guardar(tipo, contenido, file_id, fecha):
     cursor.execute(
-        "INSERT INTO mensajes (texto, chat_id, fecha) VALUES (%s,%s,%s)",
-        (texto, chat_id, fecha)
+        "INSERT INTO mensajes (tipo, contenido, file_id, fecha) VALUES (%s,%s,%s,%s)",
+        (tipo, contenido, file_id, fecha)
     )
     conn.commit()
 
 def obtener():
-    cursor.execute("SELECT * FROM mensajes")
+    cursor.execute("SELECT * FROM mensajes ORDER BY id DESC")
     return cursor.fetchall()
 
 def eliminar(id):
     cursor.execute("DELETE FROM mensajes WHERE id=%s", (id,))
     conn.commit()
 
+def actualizar(id, contenido, fecha):
+    cursor.execute(
+        "UPDATE mensajes SET contenido=%s, fecha=%s WHERE id=%s",
+        (contenido, fecha, id)
+    )
+    conn.commit()
+
 # ===== MENU =====
 def start(update, context):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
     kb = [
         [InlineKeyboardButton("📅 Programar", callback_data="prog")],
-        [InlineKeyboardButton("📋 Ver mensajes", callback_data="ver")]
+        [InlineKeyboardButton("📋 Panel", callback_data="panel")]
     ]
+    update.message.reply_text("🔥 PANEL PRO", reply_markup=InlineKeyboardMarkup(kb))
 
-    update.message.reply_text("Panel PRO 🔥", reply_markup=InlineKeyboardMarkup(kb))
+# ===== PANEL BONITO =====
+def panel(update, context):
+    q = update.callback_query
+    q.answer()
+
+    datos = obtener()
+
+    if not datos:
+        q.message.reply_text("📭 No hay mensajes programados")
+        return
+
+    for m in datos[:10]:  # últimos 10
+        id, tipo, contenido, file_id, fecha = m
+
+        texto = contenido if contenido else "(sin texto)"
+
+        msg = f"""
+🆔 ID: {id}
+📦 Tipo: {tipo}
+📝 {texto[:50]}
+⏰ {fecha}
+"""
+
+        kb = [[
+            InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{id}"),
+            InlineKeyboardButton("❌ Eliminar", callback_data=f"del_{id}")
+        ]]
+
+        q.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
 
 # ===== BOTONES =====
 def botones(update, context):
-    query = update.callback_query
-    query.answer()
+    q = update.callback_query
+    q.answer()
 
-    if query.data == "ver":
-        datos = obtener()
+    if q.data == "prog":
+        q.message.reply_text("Envía texto, imagen o video")
 
-        if not datos:
-            query.message.reply_text("No hay mensajes")
-            return
+    if q.data == "panel":
+        panel(update, context)
 
-        for m in datos:
-            id, texto, chat_id, fecha = m
+    if q.data.startswith("del_"):
+        id = int(q.data.split("_")[1])
+        eliminar(id)
+        q.message.reply_text("❌ Eliminado")
 
-            kb = [[
-                InlineKeyboardButton("❌ Eliminar", callback_data=f"del_{id}")
-            ]]
+    if q.data.startswith("edit_"):
+        id = int(q.data.split("_")[1])
+        context.user_data["editando"] = id
+        q.message.reply_text("✏️ Envía nuevo contenido")
 
-            query.message.reply_text(
-                f"ID: {id}\n{texto}\n{fecha}",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
+# ===== PROGRAMAR =====
+def enviar(context):
+    data = context.job.context
+    bot = context.bot
 
-    if query.data == "prog":
-        query.message.reply_text("Envía:\ntexto | YYYY-MM-DD HH:MM")
+    if data["tipo"] == "texto":
+        bot.send_message(data["chat"], data["contenido"])
 
-# ===== ELIMINAR =====
-def eliminar_btn(update, context):
-    query = update.callback_query
-    query.answer()
+    elif data["tipo"] == "foto":
+        bot.send_photo(data["chat"], data["file_id"], caption=data["contenido"])
 
-    id = int(query.data.split("_")[1])
-    eliminar(id)
-
-    query.message.reply_text("❌ Eliminado")
+    elif data["tipo"] == "video":
+        bot.send_video(data["chat"], data["file_id"], caption=data["contenido"])
 
 # ===== RECIBIR =====
 def recibir(update, context):
+
     if update.effective_user.id != ADMIN_ID:
         return
 
-    try:
-        texto, fecha = update.message.text.split("|")
-        fecha_dt = TIMEZONE.localize(datetime.strptime(fecha.strip(), "%Y-%m-%d %H:%M"))
+    msg = update.message
 
-        for canal in CANALES:
-            guardar(texto.strip(), canal, fecha.strip())
+    # ===== EDITAR =====
+    if "editando" in context.user_data:
+        id = context.user_data["editando"]
+        context.user_data["data_edit"] = msg.text
+        context.user_data["esperando_fecha_edit"] = True
+        update.message.reply_text("Ahora envía nueva fecha")
+        return
+
+    if context.user_data.get("esperando_fecha_edit"):
+        try:
+            fecha = msg.text
+            actualizar(
+                context.user_data["editando"],
+                context.user_data["data_edit"],
+                fecha
+            )
+            update.message.reply_text("✅ Editado")
+            context.user_data.clear()
+        except:
+            update.message.reply_text("Error en formato")
+        return
+
+    # ===== ESPERANDO FECHA =====
+    if context.user_data.get("esperando_fecha"):
+
+        try:
+            fecha = msg.text.strip()
+            fecha_dt = TIMEZONE.localize(datetime.strptime(fecha, "%Y-%m-%d %H:%M"))
+
+            data = context.user_data["data"]
+
+            guardar(data["tipo"], data["contenido"], data["file_id"], fecha)
 
             context.job_queue.run_once(
-                lambda ctx: ctx.bot.send_message(canal, texto.strip()),
-                when=(fecha_dt - datetime.now()).total_seconds()
+                enviar,
+                when=(fecha_dt - datetime.now()).total_seconds(),
+                context=data
             )
 
-        update.message.reply_text("✅ Programado")
+            update.message.reply_text("✅ Programado")
+            context.user_data.clear()
 
-    except:
-        update.message.reply_text("Formato:\ntexto | YYYY-MM-DD HH:MM")
+        except:
+            update.message.reply_text("Formato: 2026-07-16 12:30")
+
+        return
+
+    # ===== TEXTO =====
+    if msg.text:
+        context.user_data["data"] = {
+            "tipo": "texto",
+            "contenido": msg.text,
+            "file_id": None,
+            "chat": msg.chat_id
+        }
+        context.user_data["esperando_fecha"] = True
+        update.message.reply_text("Envía la fecha")
+
+    # ===== FOTO =====
+    elif msg.photo:
+        file_id = msg.photo[-1].file_id
+
+        context.user_data["data"] = {
+            "tipo": "foto",
+            "contenido": msg.caption or "",
+            "file_id": file_id,
+            "chat": msg.chat_id
+        }
+        context.user_data["esperando_fecha"] = True
+        update.message.reply_text("Envía la fecha")
+
+    # ===== VIDEO =====
+    elif msg.video:
+        file_id = msg.video.file_id
+
+        context.user_data["data"] = {
+            "tipo": "video",
+            "contenido": msg.caption or "",
+            "file_id": file_id,
+            "chat": msg.chat_id
+        }
+        context.user_data["esperando_fecha"] = True
+        update.message.reply_text("Envía la fecha")
 
 # ===== MAIN =====
 def main():
@@ -130,10 +221,9 @@ def main():
 
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CallbackQueryHandler(botones))
-    dp.add_handler(CallbackQueryHandler(eliminar_btn, pattern="del_"))
-    dp.add_handler(MessageHandler(Filters.text, recibir))
+    dp.add_handler(MessageHandler(Filters.all, recibir))
 
-    print("BOT PRO ACTIVO 🚀")
+    print("🔥 BOT PRO TOTAL ACTIVO")
     updater.start_polling()
     updater.idle()
 
