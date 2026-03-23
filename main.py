@@ -2,6 +2,7 @@ import os
 import psycopg2
 from datetime import datetime
 import pytz
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -9,7 +10,9 @@ from telegram.ext import (
 )
 
 # ===== CONFIG =====
-TOKEN = "8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJ5U"
+TOKEN = os.getenv("TOKEN")
+DB_URL = os.getenv("DATABASE_URL")
+
 ADMIN_ID = 5869414542
 
 CANALES = [
@@ -22,13 +25,8 @@ CANALES = [
 ]
 
 TIMEZONE = pytz.timezone("America/Bogota")
-DB_URL = os.getenv("DATABASE_URL")
 
 # ===== DB =====
-import os
-
-DB_URL = os.getenv("DATABASE_URL")
-
 conn = psycopg2.connect(DB_URL)
 cursor = conn.cursor()
 
@@ -44,7 +42,7 @@ CREATE TABLE IF NOT EXISTS mensajes (
 """)
 conn.commit()
 
-# ===== GUARDAR =====
+# ===== FUNCIONES DB =====
 def guardar(m):
     cursor.execute("""
     INSERT INTO mensajes (tipo, texto, file_id, chat_id, fecha)
@@ -52,17 +50,14 @@ def guardar(m):
     """, (m["tipo"], m["texto"], m["file_id"], m["chat_id"], m["fecha"]))
     conn.commit()
 
-# ===== OBTENER =====
 def obtener():
     cursor.execute("SELECT * FROM mensajes")
     return cursor.fetchall()
 
-# ===== ELIMINAR =====
 def eliminar(id):
     cursor.execute("DELETE FROM mensajes WHERE id=%s", (id,))
     conn.commit()
 
-# ===== ACTUALIZAR =====
 def actualizar(id, texto, fecha):
     cursor.execute("""
     UPDATE mensajes SET texto=%s, fecha=%s WHERE id=%s
@@ -74,12 +69,11 @@ async def enviar(context):
     job = context.job.data
     bot = context.bot
 
-    if job["tipo"] == "texto":
-        await bot.send_message(job["chat_id"], job["texto"])
-    elif job["tipo"] == "foto":
-        await bot.send_photo(job["chat_id"], job["file_id"], caption=job["texto"])
-    elif job["tipo"] == "video":
-        await bot.send_video(job["chat_id"], job["file_id"], caption=job["texto"])
+    try:
+        if job["tipo"] == "texto":
+            await bot.send_message(job["chat_id"], job["texto"])
+    except Exception as e:
+        print("Error enviando:", e)
 
 # ===== MENU =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -88,7 +82,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb = [
         [InlineKeyboardButton("📅 Programar", callback_data="prog")],
-        [InlineKeyboardButton("📋 Ver / Editar / Eliminar", callback_data="panel")]
+        [InlineKeyboardButton("📋 Ver mensajes", callback_data="panel")]
     ]
     await update.message.reply_text("Panel PRO", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -100,25 +94,23 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     datos = obtener()
 
     if not datos:
-        await q.message.reply_text("Vacío")
+        await q.message.reply_text("No hay mensajes")
         return
 
     for m in datos:
         id, tipo, texto, file_id, chat_id, fecha = m
 
-        kb = [
-            [
-                InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{id}"),
-                InlineKeyboardButton("❌ Eliminar", callback_data=f"del_{id}")
-            ]
-        ]
+        kb = [[
+            InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{id}"),
+            InlineKeyboardButton("❌ Eliminar", callback_data=f"del_{id}")
+        ]]
 
         await q.message.reply_text(
-            f"ID:{id}\n{tipo}\n{fecha}",
+            f"ID:{id}\n{texto}\n{fecha}",
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
-# ===== ELIMINAR BTN =====
+# ===== ELIMINAR =====
 async def eliminar_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -128,7 +120,7 @@ async def eliminar_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.message.reply_text("❌ Eliminado")
 
-# ===== EDITAR BTN =====
+# ===== EDITAR =====
 async def editar_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -136,7 +128,7 @@ async def editar_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     id = int(q.data.split("_")[1])
     context.user_data["editando"] = id
 
-    await q.message.reply_text("Envía nuevo texto | YYYY-MM-DD HH:MM")
+    await q.message.reply_text("Nuevo formato:\ntexto | YYYY-MM-DD HH:MM")
 
 # ===== RECIBIR =====
 async def recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -176,18 +168,23 @@ async def recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data=m
             )
 
-        await update.message.reply_text("✅ Programado en todos los canales")
+        await update.message.reply_text("✅ Programado")
 
     except:
-        await update.message.reply_text("Formato: texto | YYYY-MM-DD HH:MM")
+        await update.message.reply_text("Formato:\ntexto | YYYY-MM-DD HH:MM")
 
 # ===== MAIN =====
-app = ApplicationBuilder().token(TOKEN).build()
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(panel, pattern="panel"))
-app.add_handler(CallbackQueryHandler(eliminar_btn, pattern="del_"))
-app.add_handler(CallbackQueryHandler(editar_btn, pattern="edit_"))
-app.add_handler(MessageHandler(filters.TEXT, recibir))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(panel, pattern="panel"))
+    app.add_handler(CallbackQueryHandler(eliminar_btn, pattern="del_"))
+    app.add_handler(CallbackQueryHandler(editar_btn, pattern="edit_"))
+    app.add_handler(MessageHandler(filters.TEXT, recibir))
 
-app.run_polling()
+    print("BOT ENCENDIDO 🔥")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
