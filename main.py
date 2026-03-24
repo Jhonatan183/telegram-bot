@@ -39,44 +39,30 @@ CREATE TABLE IF NOT EXISTS mensajes (
 """)
 conn.commit()
 
-# ===== DB FUNCIONES =====
+# ===== FUNCIONES DB =====
 def guardar(tipo, contenido, file_id, fecha, canal):
-    try:
-        cursor.execute(
-            "INSERT INTO mensajes (tipo, contenido, file_id, fecha, canal) VALUES (%s,%s,%s,%s,%s) RETURNING id",
-            (tipo, contenido, file_id, fecha, canal)
-        )
-        id_msg = cursor.fetchone()[0]
-        conn.commit()
-        return id_msg
-    except:
-        conn.rollback()
-        return None
+    cursor.execute(
+        "INSERT INTO mensajes (tipo, contenido, file_id, fecha, canal) VALUES (%s,%s,%s,%s,%s) RETURNING id",
+        (tipo, contenido, file_id, fecha, canal)
+    )
+    id_msg = cursor.fetchone()[0]
+    conn.commit()
+    return id_msg
 
 def obtener():
-    try:
-        cursor.execute("SELECT * FROM mensajes ORDER BY id DESC")
-        return cursor.fetchall()
-    except:
-        conn.rollback()
-        return []
+    cursor.execute("SELECT * FROM mensajes ORDER BY id DESC")
+    return cursor.fetchall()
 
 def eliminar(id):
-    try:
-        cursor.execute("DELETE FROM mensajes WHERE id=%s", (id,))
-        conn.commit()
-    except:
-        conn.rollback()
+    cursor.execute("DELETE FROM mensajes WHERE id=%s", (id,))
+    conn.commit()
 
 def actualizar(id, contenido, fecha):
-    try:
-        cursor.execute(
-            "UPDATE mensajes SET contenido=%s, fecha=%s WHERE id=%s",
-            (contenido, fecha, id)
-        )
-        conn.commit()
-    except:
-        conn.rollback()
+    cursor.execute(
+        "UPDATE mensajes SET contenido=%s, fecha=%s WHERE id=%s",
+        (contenido, fecha, id)
+    )
+    conn.commit()
 
 # ===== ESTADÍSTICAS =====
 def estadisticas():
@@ -111,9 +97,7 @@ def grafico():
 # ===== RECUPERAR =====
 def recuperar(context):
     cursor.execute("SELECT * FROM mensajes WHERE enviado=FALSE")
-    datos = cursor.fetchall()
-
-    for m in datos:
+    for m in cursor.fetchall():
         id, tipo, contenido, file_id, fecha, canal, enviado = m
 
         try:
@@ -121,7 +105,7 @@ def recuperar(context):
         except:
             continue
 
-        delay = (fecha_dt - datetime.now()).total_seconds()
+        delay = (fecha_dt - datetime.now(TIMEZONE)).total_seconds()
 
         if delay <= 0:
             continue
@@ -138,46 +122,51 @@ def recuperar(context):
             }
         )
 
-# ===== CALENDARIO 15 DÍAS =====
+# ===== CALENDARIO =====
 def calendario(update, context):
     hoy = datetime.now(TIMEZONE)
     botones = []
 
-    for i in range(15):  # 🔥 15 días
+    for i in range(15):
         dia = hoy + timedelta(days=i)
         fecha_str = dia.strftime("%Y-%m-%d")
 
         botones.append([
-            InlineKeyboardButton(
-                dia.strftime("%d %b"),
-                callback_data=f"fecha_{fecha_str}"
-            )
+            InlineKeyboardButton(dia.strftime("%d %b"), callback_data=f"fecha_{fecha_str}")
         ])
 
-    update.message.reply_text(
-        "📅 Selecciona día",
-        reply_markup=InlineKeyboardMarkup(botones)
-    )
+    update.message.reply_text("📅 Selecciona día", reply_markup=InlineKeyboardMarkup(botones))
 
 def horas(update, context):
     q = update.callback_query
     q.answer()
 
     fecha = q.data.split("_")[1]
-    context.user_data["fecha_base"] = fecha
+    context.user_data["fecha"] = fecha
 
     botones = []
-
     for h in range(24):
-        hora = f"{h:02d}:00"
-        botones.append([
-            InlineKeyboardButton(hora, callback_data=f"hora_{hora}")
-        ])
+        botones.append([InlineKeyboardButton(f"{h:02d}:00", callback_data=f"hora_{h:02d}")])
 
-    q.message.reply_text(
-        "⏰ Selecciona hora",
-        reply_markup=InlineKeyboardMarkup(botones)
-    )
+    q.message.reply_text("⏰ Selecciona hora", reply_markup=InlineKeyboardMarkup(botones))
+
+def minutos(update, context):
+    q = update.callback_query
+    q.answer()
+
+    botones = []
+    fila = []
+
+    for i in range(0, 60, 5):
+        fila.append(InlineKeyboardButton(f"{i:02d}", callback_data=f"min_{i}"))
+        if len(fila) == 6:
+            botones.append(fila)
+            fila = []
+
+    if fila:
+        botones.append(fila)
+
+    q.message.reply_text("⏱ Selecciona minutos", reply_markup=InlineKeyboardMarkup(botones))
 
 # ===== MENU =====
 def start(update, context):
@@ -195,13 +184,8 @@ def panel(update, context):
 
     datos = obtener()
 
-    if not datos:
-        q.message.reply_text("Sin mensajes")
-        return
-
     for m in datos[:10]:
         id, tipo, contenido, file_id, fecha, canal, enviado = m
-
         estado = "✅" if enviado else "⏳"
 
         kb = [[
@@ -209,89 +193,83 @@ def panel(update, context):
             InlineKeyboardButton("❌", callback_data=f"del_{id}")
         ]]
 
-        q.message.reply_text(
-            f"{id} | {canal} | {fecha} | {estado}",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+        q.message.reply_text(f"{id} | {canal} | {fecha} | {estado}", reply_markup=InlineKeyboardMarkup(kb))
 
 # ===== BOTONES =====
 def botones(update, context):
     q = update.callback_query
     q.answer()
 
-    if q.data == "prog":
+    data = q.data
+
+    if data == "prog":
         kb = [[InlineKeyboardButton(c, callback_data=f"canal_{c}")]
               for c in CANALES.keys()]
         kb.append([InlineKeyboardButton("🔥 TODOS", callback_data="canal_all")])
         q.message.reply_text("Selecciona canal", reply_markup=InlineKeyboardMarkup(kb))
 
-    elif q.data.startswith("canal_"):
-        context.user_data["canal"] = "ALL" if q.data == "canal_all" else q.data.split("_")[1]
+    elif data.startswith("canal_"):
+        context.user_data["canal"] = "ALL" if data == "canal_all" else data.split("_")[1]
         q.message.reply_text("Envía contenido")
 
-    elif q.data.startswith("fecha_"):
+    elif data.startswith("fecha_"):
         horas(update, context)
 
-    elif q.data.startswith("hora_"):
-        hora = q.data.split("_")[1]
-        fecha = context.user_data.get("fecha_base")
+    elif data.startswith("hora_"):
+        context.user_data["hora"] = data.split("_")[1]
+        minutos(update, context)
 
-        if not fecha:
-            q.message.reply_text("Error")
-            return
+    elif data.startswith("min_"):
+        minuto = data.split("_")[1]
 
-        fecha_final = f"{fecha} {hora}"
+        fecha = context.user_data.get("fecha")
+        hora = context.user_data.get("hora")
+        canal = context.user_data.get("canal")
+        data_msg = context.user_data.get("data")
+
+        fecha_final = f"{fecha} {hora}:{minuto}"
+
         fecha_dt = TIMEZONE.localize(datetime.strptime(fecha_final, "%Y-%m-%d %H:%M"))
 
-        data = context.user_data.get("data")
-        canal = context.user_data.get("canal")
-
-        id_msg = guardar(data["tipo"], data["contenido"], data["file_id"], fecha_final, canal)
+        id_msg = guardar(data_msg["tipo"], data_msg["contenido"], data_msg["file_id"], fecha_final, canal)
 
         delay = (fecha_dt - datetime.now(TIMEZONE)).total_seconds()
 
         context.job_queue.run_once(
             enviar,
             when=delay,
-            context={**data, "canal": canal, "id": id_msg}
+            context={**data_msg, "canal": canal, "id": id_msg}
         )
 
         context.user_data.clear()
         q.message.reply_text("✅ Programado")
 
-    elif q.data == "panel":
+    elif data == "panel":
         panel(update, context)
 
-    elif q.data == "stats":
+    elif data == "stats":
         q.message.reply_text(estadisticas())
         ruta = grafico()
         if ruta:
             q.message.reply_photo(open(ruta, "rb"))
 
-    elif q.data.startswith("del_"):
-        eliminar(int(q.data.split("_")[1]))
+    elif data.startswith("del_"):
+        eliminar(int(data.split("_")[1]))
         q.message.reply_text("Eliminado")
-
-    elif q.data.startswith("edit_"):
-        context.user_data["editando"] = int(q.data.split("_")[1])
-        q.message.reply_text("Nuevo texto")
 
 # ===== ENVÍO =====
 def enviar(context):
     data = context.job.context
     bot = context.bot
 
-    try:
-        if data["canal"] == "ALL":
-            for canal_id in CANALES.values():
-                enviar_tipo(bot, canal_id, data)
-        else:
-            enviar_tipo(bot, CANALES[data["canal"]], data)
+    if data["canal"] == "ALL":
+        for canal_id in CANALES.values():
+            enviar_tipo(bot, canal_id, data)
+    else:
+        enviar_tipo(bot, CANALES[data["canal"]], data)
 
-        cursor.execute("UPDATE mensajes SET enviado=TRUE WHERE id=%s", (data["id"],))
-        conn.commit()
-    except:
-        conn.rollback()
+    cursor.execute("UPDATE mensajes SET enviado=TRUE WHERE id=%s", (data["id"],))
+    conn.commit()
 
 def enviar_tipo(bot, canal_id, data):
     if data["tipo"] == "texto":
@@ -307,13 +285,6 @@ def recibir(update, context):
         return
 
     msg = update.message
-
-    if "editando" in context.user_data:
-        context.user_data["nuevo"] = msg.text
-        context.user_data["esperando_edit"] = True
-        update.message.reply_text("Nueva fecha con calendario")
-        calendario(update, context)
-        return
 
     if msg.text:
         context.user_data["data"] = {"tipo": "texto", "contenido": msg.text, "file_id": None}
@@ -346,7 +317,6 @@ def main():
 
     recuperar(updater)
 
-    print("🔥 BOT PRO MAX ACTIVO")
     updater.start_polling()
     updater.idle()
 
