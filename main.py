@@ -248,7 +248,7 @@ def botones(update, context):
 
         id_msg = guardar(data["tipo"], data["contenido"], data["file_id"], fecha_final, canal)
 
-        delay = (fecha_dt - datetime.now()).total_seconds()
+        delay = (fecha_dt - datetime.now(TIMEZONE)).total_seconds()
 
         context.job_queue.run_once(
             enviar,
