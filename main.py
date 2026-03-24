@@ -1,5 +1,5 @@
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import matplotlib.pyplot as plt
 
@@ -9,12 +9,10 @@ from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageH
 # ===== CONFIG =====
 TOKEN = "8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJ5U"
 DB_URL = "postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@postgres.railway.internal:5432/railway"
-
 ADMINS = [5869414542]
 
 TIMEZONE = pytz.timezone("America/Bogota")
 
-# 🔥 TUS CANALES COMPLETOS
 CANALES = {
     "Canal 1": -1001939817105,
     "Canal 2": -1002496825506,
@@ -41,7 +39,7 @@ CREATE TABLE IF NOT EXISTS mensajes (
 """)
 conn.commit()
 
-# ===== DB SEGURA =====
+# ===== DB FUNCIONES =====
 def guardar(tipo, contenido, file_id, fecha, canal):
     try:
         cursor.execute(
@@ -82,98 +80,113 @@ def actualizar(id, contenido, fecha):
 
 # ===== ESTADÍSTICAS =====
 def estadisticas():
-    try:
-        cursor.execute("SELECT COUNT(*) FROM mensajes")
-        total = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM mensajes")
+    total = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(*) FROM mensajes WHERE enviado=TRUE")
-        enviados = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM mensajes WHERE enviado=TRUE")
+    enviados = cursor.fetchone()[0]
 
-        cursor.execute("SELECT canal, COUNT(*) FROM mensajes GROUP BY canal")
-        canales = cursor.fetchall()
+    return f"📊 Total: {total}\n✅ Enviados: {enviados}"
 
-        texto = f"📊 ESTADÍSTICAS\n\n📨 Total: {total}\n✅ Enviados: {enviados}\n\n"
+def grafico():
+    cursor.execute("SELECT canal, COUNT(*) FROM mensajes GROUP BY canal")
+    datos = cursor.fetchall()
 
-        for c in canales:
-            texto += f"📡 {c[0]}: {c[1]}\n"
-
-        return texto
-    except:
-        conn.rollback()
-        return "Error"
-
-def grafico_estadisticas():
-    try:
-        cursor.execute("SELECT canal, COUNT(*) FROM mensajes GROUP BY canal")
-        datos = cursor.fetchall()
-
-        if not datos:
-            return None
-
-        canales = [d[0] for d in datos]
-        cantidades = [d[1] for d in datos]
-
-        plt.figure()
-        plt.bar(canales, cantidades)
-        plt.title("Mensajes por canal")
-
-        ruta = "grafico.png"
-        plt.savefig(ruta)
-        plt.close()
-
-        return ruta
-    except:
-        conn.rollback()
+    if not datos:
         return None
 
-# ===== RECUPERACIÓN =====
-def recuperar_mensajes(context):
-    try:
-        cursor.execute("SELECT * FROM mensajes WHERE enviado=FALSE")
-        datos = cursor.fetchall()
+    canales = [d[0] for d in datos]
+    cantidades = [d[1] for d in datos]
 
-        for m in datos:
-            id, tipo, contenido, file_id, fecha, canal, enviado = m
+    plt.figure()
+    plt.bar(canales, cantidades)
+    plt.title("Mensajes por canal")
 
+    ruta = "grafico.png"
+    plt.savefig(ruta)
+    plt.close()
+
+    return ruta
+
+# ===== RECUPERAR =====
+def recuperar(context):
+    cursor.execute("SELECT * FROM mensajes WHERE enviado=FALSE")
+    datos = cursor.fetchall()
+
+    for m in datos:
+        id, tipo, contenido, file_id, fecha, canal, enviado = m
+
+        try:
             fecha_dt = TIMEZONE.localize(datetime.strptime(fecha, "%Y-%m-%d %H:%M"))
-            delay = (fecha_dt - datetime.now()).total_seconds()
+        except:
+            continue
 
-            if delay <= 0:
-                continue
+        delay = (fecha_dt - datetime.now()).total_seconds()
 
-            context.job_queue.run_once(
-                enviar,
-                when=delay,
-                context={
-                    "id": id,
-                    "tipo": tipo,
-                    "contenido": contenido,
-                    "file_id": file_id,
-                    "canal": canal
-                }
+        if delay <= 0:
+            continue
+
+        context.job_queue.run_once(
+            enviar,
+            when=delay,
+            context={
+                "id": id,
+                "tipo": tipo,
+                "contenido": contenido,
+                "file_id": file_id,
+                "canal": canal
+            }
+        )
+
+# ===== CALENDARIO 15 DÍAS =====
+def calendario(update, context):
+    hoy = datetime.now(TIMEZONE)
+    botones = []
+
+    for i in range(15):  # 🔥 15 días
+        dia = hoy + timedelta(days=i)
+        fecha_str = dia.strftime("%Y-%m-%d")
+
+        botones.append([
+            InlineKeyboardButton(
+                dia.strftime("%d %b"),
+                callback_data=f"fecha_{fecha_str}"
             )
+        ])
 
-        print("Mensajes recuperados:", len(datos))
+    update.message.reply_text(
+        "📅 Selecciona día",
+        reply_markup=InlineKeyboardMarkup(botones)
+    )
 
-    except:
-        conn.rollback()
+def horas(update, context):
+    q = update.callback_query
+    q.answer()
+
+    fecha = q.data.split("_")[1]
+    context.user_data["fecha_base"] = fecha
+
+    botones = []
+
+    for h in range(24):
+        hora = f"{h:02d}:00"
+        botones.append([
+            InlineKeyboardButton(hora, callback_data=f"hora_{hora}")
+        ])
+
+    q.message.reply_text(
+        "⏰ Selecciona hora",
+        reply_markup=InlineKeyboardMarkup(botones)
+    )
 
 # ===== MENU =====
 def start(update, context):
-    texto = """🔥 BOT PRO MAX
-
-📅 Programar contenido
-📋 Ver panel
-📊 Ver estadísticas
-"""
-
     kb = [
         [InlineKeyboardButton("📅 Programar", callback_data="prog")],
         [InlineKeyboardButton("📋 Panel", callback_data="panel")],
         [InlineKeyboardButton("📊 Estadísticas", callback_data="stats")]
     ]
-
-    update.message.reply_text(texto, reply_markup=InlineKeyboardMarkup(kb))
+    update.message.reply_text("🔥 BOT PRO", reply_markup=InlineKeyboardMarkup(kb))
 
 # ===== PANEL =====
 def panel(update, context):
@@ -192,12 +205,12 @@ def panel(update, context):
         estado = "✅" if enviado else "⏳"
 
         kb = [[
-            InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{id}"),
-            InlineKeyboardButton("❌ Eliminar", callback_data=f"del_{id}")
+            InlineKeyboardButton("✏️", callback_data=f"edit_{id}"),
+            InlineKeyboardButton("❌", callback_data=f"del_{id}")
         ]]
 
         q.message.reply_text(
-            f"🆔 {id}\n📡 {canal}\n📦 {tipo}\n⏰ {fecha}\n{estado}",
+            f"{id} | {canal} | {fecha} | {estado}",
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
@@ -213,21 +226,47 @@ def botones(update, context):
         q.message.reply_text("Selecciona canal", reply_markup=InlineKeyboardMarkup(kb))
 
     elif q.data.startswith("canal_"):
-        if q.data == "canal_all":
-            context.user_data["canal"] = "ALL"
-        else:
-            context.user_data["canal"] = q.data.split("_")[1]
+        context.user_data["canal"] = "ALL" if q.data == "canal_all" else q.data.split("_")[1]
+        q.message.reply_text("Envía contenido")
 
-        q.message.reply_text("Envía contenido (texto, foto o video)")
+    elif q.data.startswith("fecha_"):
+        horas(update, context)
+
+    elif q.data.startswith("hora_"):
+        hora = q.data.split("_")[1]
+        fecha = context.user_data.get("fecha_base")
+
+        if not fecha:
+            q.message.reply_text("Error")
+            return
+
+        fecha_final = f"{fecha} {hora}"
+        fecha_dt = TIMEZONE.localize(datetime.strptime(fecha_final, "%Y-%m-%d %H:%M"))
+
+        data = context.user_data.get("data")
+        canal = context.user_data.get("canal")
+
+        id_msg = guardar(data["tipo"], data["contenido"], data["file_id"], fecha_final, canal)
+
+        delay = (fecha_dt - datetime.now()).total_seconds()
+
+        context.job_queue.run_once(
+            enviar,
+            when=delay,
+            context={**data, "canal": canal, "id": id_msg}
+        )
+
+        context.user_data.clear()
+        q.message.reply_text("✅ Programado")
 
     elif q.data == "panel":
         panel(update, context)
 
     elif q.data == "stats":
         q.message.reply_text(estadisticas())
-        ruta = grafico_estadisticas()
+        ruta = grafico()
         if ruta:
-            q.message.reply_photo(photo=open(ruta, "rb"))
+            q.message.reply_photo(open(ruta, "rb"))
 
     elif q.data.startswith("del_"):
         eliminar(int(q.data.split("_")[1]))
@@ -247,12 +286,10 @@ def enviar(context):
             for canal_id in CANALES.values():
                 enviar_tipo(bot, canal_id, data)
         else:
-            canal_id = CANALES[data["canal"]]
-            enviar_tipo(bot, canal_id, data)
+            enviar_tipo(bot, CANALES[data["canal"]], data)
 
         cursor.execute("UPDATE mensajes SET enviado=TRUE WHERE id=%s", (data["id"],))
         conn.commit()
-
     except:
         conn.rollback()
 
@@ -266,7 +303,6 @@ def enviar_tipo(bot, canal_id, data):
 
 # ===== RECIBIR =====
 def recibir(update, context):
-
     if update.effective_user.id not in ADMINS:
         return
 
@@ -274,41 +310,14 @@ def recibir(update, context):
 
     if "editando" in context.user_data:
         context.user_data["nuevo"] = msg.text
-        context.user_data["esperando_fecha_edit"] = True
-        update.message.reply_text("Nueva fecha")
-        return
-
-    if context.user_data.get("esperando_fecha_edit"):
-        actualizar(context.user_data["editando"], context.user_data["nuevo"], msg.text)
-        context.user_data.clear()
-        update.message.reply_text("Editado")
-        return
-
-    if context.user_data.get("esperando_fecha"):
-        fecha = msg.text
-        fecha_dt = TIMEZONE.localize(datetime.strptime(fecha, "%Y-%m-%d %H:%M"))
-
-        data = context.user_data["data"]
-        canal = context.user_data["canal"]
-
-        id_msg = guardar(data["tipo"], data["contenido"], data["file_id"], fecha, canal)
-
-        delay = (fecha_dt - datetime.now()).total_seconds()
-
-        context.job_queue.run_once(
-            enviar,
-            when=delay,
-            context={**data, "canal": canal, "id": id_msg}
-        )
-
-        context.user_data.clear()
-        update.message.reply_text("Programado")
+        context.user_data["esperando_edit"] = True
+        update.message.reply_text("Nueva fecha con calendario")
+        calendario(update, context)
         return
 
     if msg.text:
         context.user_data["data"] = {"tipo": "texto", "contenido": msg.text, "file_id": None}
-        context.user_data["esperando_fecha"] = True
-        update.message.reply_text("Envía fecha")
+        calendario(update, context)
 
     elif msg.photo:
         context.user_data["data"] = {
@@ -316,8 +325,7 @@ def recibir(update, context):
             "contenido": msg.caption or "",
             "file_id": msg.photo[-1].file_id
         }
-        context.user_data["esperando_fecha"] = True
-        update.message.reply_text("Envía fecha")
+        calendario(update, context)
 
     elif msg.video:
         context.user_data["data"] = {
@@ -325,8 +333,7 @@ def recibir(update, context):
             "contenido": msg.caption or "",
             "file_id": msg.video.file_id
         }
-        context.user_data["esperando_fecha"] = True
-        update.message.reply_text("Envía fecha")
+        calendario(update, context)
 
 # ===== MAIN =====
 def main():
@@ -337,10 +344,9 @@ def main():
     dp.add_handler(CallbackQueryHandler(botones))
     dp.add_handler(MessageHandler(Filters.all, recibir))
 
-    print("🔥 BOT PRO FINAL ACTIVO")
+    recuperar(updater)
 
-    recuperar_mensajes(updater)
-
+    print("🔥 BOT PRO MAX ACTIVO")
     updater.start_polling()
     updater.idle()
 
