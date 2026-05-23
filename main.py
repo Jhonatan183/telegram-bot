@@ -11,7 +11,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
 # ===== CONFIG =====
-TOKEN = os.environ.get("8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJ5U")
+TOKEN = os.environ.get("8192711687:AAFxHdoEJCWQMWcXNstKKTWaI1TzlG5SoQU")
 DB_URL = "postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@centerbeam.proxy.rlwy.net:45270/railway"
 ADMINS = [5869414542]
 TIMEZONE = pytz.timezone("America/Bogota")
