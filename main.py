@@ -12,7 +12,7 @@ from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageH
 
 # ===== CONFIG =====
 TOKEN = os.environ.get("8192711687:AAFYKMnTNFrnYJooUZ6LPRFZ7A1RhElRJ5U")
-DB_URL = os.environ.get("postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@postgres.railway.internal:5432/railway")
+DB_URL = os.environ.get("postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@centerbeam.proxy.rlwy.net:45270/railway")
 
 ADMINS = [5869414542]
 TIMEZONE = pytz.timezone("America/Bogota")
