@@ -11,7 +11,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
 # ===== CONFIG =====
-TOKEN = ("8192711687:AAFxHdoEJCWQMWcXNstKKTWaI1TzlG5SoQU")
+TOKEN = ("8192711687:AAEMnhydzn-R0QICph4Jy66Iv8etaTO3CbA")
 DB_URL = ("postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@centerbeam.proxy.rlwy.net:45270/railway")
 
 ADMINS = [5869414542]
