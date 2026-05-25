@@ -11,8 +11,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
 # ===== CONFIG =====
-TOKEN = ("8192711687:AAFxHdoEJCWQMWcXNstKKTWaI1TzlG5SoQU")
-DB_URL = ("postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@centerbeam.proxy.rlwy.net:45270/railway")
+TOKEN = os.environ.get("8192711687:AAFxHdoEJCWQMWcXNstKKTWaI1TzlG5SoQU")
+DB_URL = os.environ.get("postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@centerbeam.proxy.rlwy.net:45270/railway")
 
 ADMINS = [5869414542]
 TIMEZONE = pytz.timezone("America/Bogota")
@@ -33,7 +33,7 @@ def get_connection():
 conn = get_connection()
 cursor = conn.cursor()
 
-# ===== CREAR TABLAS =====
+# ===== CREAR Y MIGRAR TABLAS =====
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS mensajes (
         id SERIAL PRIMARY KEY,
@@ -46,6 +46,9 @@ cursor.execute("""
         recurrente TEXT DEFAULT NULL
     )
 """)
+cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS recurrente TEXT DEFAULT NULL")
+cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS enviado BOOLEAN DEFAULT FALSE")
+
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS canales (
         id SERIAL PRIMARY KEY,
@@ -61,7 +64,6 @@ cursor.execute("""
     )
 """)
 
-# Insertar canales base si la tabla está vacía
 cursor.execute("SELECT COUNT(*) FROM canales")
 if cursor.fetchone()[0] == 0:
     canales_base = [
@@ -112,11 +114,20 @@ def guardar(tipo, contenido, file_id, fecha, canal, recurrente=None):
     conn.commit()
     return id_msg
 
-def obtener(solo_pendientes=False):
+def obtener(solo_pendientes=False, solo_enviados=False, solo_recurrentes=False, canal_filtro=None):
+    condiciones = []
+    params = []
     if solo_pendientes:
-        safe_execute("SELECT * FROM mensajes WHERE enviado=FALSE ORDER BY fecha ASC")
-    else:
-        safe_execute("SELECT * FROM mensajes ORDER BY id DESC")
+        condiciones.append("enviado=FALSE")
+    if solo_enviados:
+        condiciones.append("enviado=TRUE")
+    if solo_recurrentes:
+        condiciones.append("recurrente IS NOT NULL")
+    if canal_filtro:
+        condiciones.append("canal=%s")
+        params.append(canal_filtro)
+    where = f"WHERE {' AND '.join(condiciones)}" if condiciones else ""
+    safe_execute(f"SELECT * FROM mensajes {where} ORDER BY id DESC", params)
     return cursor.fetchall()
 
 def eliminar(id):
@@ -130,6 +141,61 @@ def actualizar_mensaje(id, contenido, fecha):
     )
     conn.commit()
 
+# ===== LIMPIEZA AUTOMÁTICA =====
+def limpiar_viejos(context):
+    try:
+        fecha_limite = (datetime.now(TIMEZONE) - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
+        safe_execute("DELETE FROM mensajes WHERE enviado=TRUE AND fecha < %s", (fecha_limite,))
+        eliminados_msg = cursor.rowcount
+        safe_execute("DELETE FROM errores WHERE fecha < %s", (fecha_limite,))
+        eliminados_err = cursor.rowcount
+        conn.commit()
+        print(f"🧹 Limpieza: {eliminados_msg} mensajes y {eliminados_err} errores eliminados", flush=True)
+    except Exception as e:
+        log_error(e)
+
+# ===== RESUMEN SEMANAL =====
+def resumen_semanal(context):
+    try:
+        safe_execute("SELECT COUNT(*) FROM mensajes")
+        total = cursor.fetchone()[0]
+        safe_execute("SELECT COUNT(*) FROM mensajes WHERE enviado=TRUE")
+        enviados = cursor.fetchone()[0]
+        safe_execute("SELECT COUNT(*) FROM mensajes WHERE enviado=FALSE")
+        pendientes = cursor.fetchone()[0]
+        safe_execute("SELECT COUNT(*) FROM mensajes WHERE recurrente IS NOT NULL AND enviado=FALSE")
+        recurrentes = cursor.fetchone()[0]
+        safe_execute("SELECT canal, COUNT(*) FROM mensajes WHERE enviado=TRUE GROUP BY canal ORDER BY COUNT(*) DESC LIMIT 3")
+        top_canales = cursor.fetchall()
+        safe_execute("SELECT COUNT(*) FROM canales")
+        n_canales = cursor.fetchone()[0]
+        safe_execute("SELECT COUNT(*) FROM errores")
+        n_errores = cursor.fetchone()[0]
+
+        top_txt = ""
+        for canal, count in top_canales:
+            top_txt += f"  • {canal}: {count} mensajes\n"
+
+        texto = (
+            f"📊 *Resumen Semanal — Bot PRO*\n"
+            f"_{datetime.now(TIMEZONE).strftime('%d/%m/%Y')}_\n\n"
+            f"📨 Total mensajes: {total}\n"
+            f"✅ Enviados: {enviados}\n"
+            f"⏳ Pendientes: {pendientes}\n"
+            f"🔁 Recurrentes activos: {recurrentes}\n"
+            f"📢 Canales registrados: {n_canales}\n"
+            f"🚨 Errores registrados: {n_errores}\n\n"
+            f"🏆 *Top canales:*\n{top_txt if top_txt else '  Sin datos aún'}"
+        )
+        bot = context.bot
+        for admin_id in ADMINS:
+            try:
+                bot.send_message(admin_id, texto, parse_mode="Markdown")
+            except Exception as e:
+                log_error(e)
+    except Exception as e:
+        log_error(e)
+
 # ===== ESTADÍSTICAS =====
 def estadisticas():
     safe_execute("SELECT COUNT(*) FROM mensajes")
@@ -138,14 +204,20 @@ def estadisticas():
     enviados = cursor.fetchone()[0]
     safe_execute("SELECT COUNT(*) FROM mensajes WHERE enviado=FALSE")
     pendientes = cursor.fetchone()[0]
+    safe_execute("SELECT COUNT(*) FROM mensajes WHERE recurrente IS NOT NULL AND enviado=FALSE")
+    recurrentes = cursor.fetchone()[0]
     safe_execute("SELECT COUNT(*) FROM canales")
     n_canales = cursor.fetchone()[0]
+    safe_execute("SELECT COUNT(*) FROM errores")
+    n_errores = cursor.fetchone()[0]
     return (
         f"📊 *Estadísticas del Bot*\n\n"
         f"📨 Total mensajes: {total}\n"
         f"✅ Enviados: {enviados}\n"
         f"⏳ Pendientes: {pendientes}\n"
-        f"📢 Canales registrados: {n_canales}"
+        f"🔁 Recurrentes activos: {recurrentes}\n"
+        f"📢 Canales registrados: {n_canales}\n"
+        f"🚨 Errores en log: {n_errores}"
     )
 
 def grafico():
@@ -167,7 +239,7 @@ def grafico():
     plt.close()
     return ruta
 
-# ===== RECUPERAR MENSAJES PENDIENTES AL INICIAR =====
+# ===== RECUPERAR AL INICIAR =====
 def recuperar(dispatcher):
     safe_execute("SELECT * FROM mensajes WHERE enviado=FALSE")
     for m in cursor.fetchall():
@@ -209,8 +281,7 @@ def calendario(update, context):
 def mostrar_horas(update, context):
     q = update.callback_query
     q.answer()
-    fecha = q.data.split("_")[1]
-    context.user_data["fecha"] = fecha
+    context.user_data["fecha"] = q.data.split("_")[1]
     botones = []
     fila = []
     for h in range(24):
@@ -244,7 +315,7 @@ def start(update, context):
     context.user_data.clear()
     kb = [
         [InlineKeyboardButton("📅 Programar mensaje", callback_data="prog")],
-        [InlineKeyboardButton("📋 Panel de mensajes", callback_data="panel")],
+        [InlineKeyboardButton("📋 Panel de mensajes", callback_data="panel_menu")],
         [InlineKeyboardButton("📢 Gestionar canales", callback_data="menu_canales")],
         [InlineKeyboardButton("📊 Estadísticas", callback_data="stats")]
     ]
@@ -254,12 +325,34 @@ def start(update, context):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-# ===== PANEL DE MENSAJES =====
-def panel(update, context):
+# ===== PANEL CON FILTROS =====
+def panel_menu(update, context):
+    q = update.callback_query
+    q.answer()
+    kb = [
+        [InlineKeyboardButton("📋 Todos", callback_data="panel_filter_todos")],
+        [InlineKeyboardButton("⏳ Pendientes", callback_data="panel_filter_pendientes")],
+        [InlineKeyboardButton("✅ Enviados", callback_data="panel_filter_enviados")],
+        [InlineKeyboardButton("🔁 Recurrentes", callback_data="panel_filter_recurrentes")],
+        [InlineKeyboardButton("🔙 Menú principal", callback_data="main_menu")]
+    ]
+    q.message.reply_text("📋 *Panel de mensajes*\n\n¿Qué quieres ver?", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+def panel(update, context, filtro="todos"):
     q = update.callback_query
     q.answer()
     page = context.user_data.get("panel_page", 0)
-    datos = obtener(solo_pendientes=False)
+    context.user_data["panel_filtro"] = filtro
+
+    if filtro == "pendientes":
+        datos = obtener(solo_pendientes=True)
+    elif filtro == "enviados":
+        datos = obtener(solo_enviados=True)
+    elif filtro == "recurrentes":
+        datos = obtener(solo_recurrentes=True)
+    else:
+        datos = obtener()
+
     total = len(datos)
     por_pagina = 5
     inicio = page * por_pagina
@@ -267,15 +360,25 @@ def panel(update, context):
     pagina = datos[inicio:fin]
 
     if not pagina:
-        q.message.reply_text("📭 No hay mensajes registrados.")
+        kb = [[InlineKeyboardButton("🔙 Volver", callback_data="panel_menu")]]
+        q.message.reply_text("📭 No hay mensajes en esta categoría.", reply_markup=InlineKeyboardMarkup(kb))
         return
+
+    filtro_txt = {"todos": "Todos", "pendientes": "⏳ Pendientes", "enviados": "✅ Enviados", "recurrentes": "🔁 Recurrentes"}
+    q.message.reply_text(f"*{filtro_txt.get(filtro, 'Todos')}* — Página {page+1} | Total: {total}", parse_mode="Markdown")
 
     for m in pagina:
         id, tipo, contenido, file_id, fecha, canal, enviado, recurrente = m
         estado = "✅ Enviado" if enviado else "⏳ Pendiente"
         rec = f" | 🔁 {recurrente}" if recurrente else ""
-        texto = f"*ID:* {id} | *Canal:* {canal}\n*Fecha:* {fecha} | {estado}{rec}\n*Contenido:* {str(contenido)[:50]}..."
-        kb = []
+        texto = (
+            f"*ID:* {id}\n"
+            f"*Canal:* {canal}\n"
+            f"*Fecha:* {fecha}\n"
+            f"*Estado:* {estado}{rec}\n"
+            f"*Tipo:* {tipo}"
+        )
+        kb = [[InlineKeyboardButton("👁 Ver detalle", callback_data=f"detalle_{id}")]]
         if not enviado:
             kb.append([
                 InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{id}"),
@@ -290,8 +393,40 @@ def panel(update, context):
         nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"panel_page_{page-1}"))
     if fin < total:
         nav.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"panel_page_{page+1}"))
+    nav_kb = []
     if nav:
-        q.message.reply_text(f"Página {page+1} | Total: {total}", reply_markup=InlineKeyboardMarkup([nav]))
+        nav_kb.append(nav)
+    nav_kb.append([InlineKeyboardButton("🔙 Filtros", callback_data="panel_menu")])
+    q.message.reply_text("Navegación:", reply_markup=InlineKeyboardMarkup(nav_kb))
+
+def ver_detalle(update, context, id_msg):
+    q = update.callback_query
+    q.answer()
+    safe_execute("SELECT * FROM mensajes WHERE id=%s", (id_msg,))
+    m = cursor.fetchone()
+    if not m:
+        q.message.reply_text("❌ Mensaje no encontrado.")
+        return
+    id, tipo, contenido, file_id, fecha, canal, enviado, recurrente = m
+    estado = "✅ Enviado" if enviado else "⏳ Pendiente"
+    rec = recurrente if recurrente else "No"
+    file_txt = f"\n*File ID:* `{file_id}`" if file_id else ""
+    texto = (
+        f"👁 *Detalle del mensaje #{id}*\n\n"
+        f"*Canal:* {canal}\n"
+        f"*Fecha:* {fecha}\n"
+        f"*Estado:* {estado}\n"
+        f"*Tipo:* {tipo}\n"
+        f"*Recurrente:* {rec}{file_txt}\n\n"
+        f"*Contenido completo:*\n{contenido or '_(archivo multimedia)_'}"
+    )
+    kb = [[InlineKeyboardButton("🔙 Volver", callback_data=f"panel_filter_{context.user_data.get('panel_filtro', 'todos')}")]]
+    if not enviado:
+        kb.insert(0, [
+            InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{id}"),
+            InlineKeyboardButton("❌ Eliminar", callback_data=f"confirm_del_{id}")
+        ])
+    q.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 # ===== GESTIÓN DE CANALES =====
 def menu_canales(update, context):
@@ -301,7 +436,7 @@ def menu_canales(update, context):
     texto = "📢 *Canales registrados:*\n\n"
     if canales:
         for nombre, cid in canales.items():
-            texto += f"• {nombre}: `{cid}`\n"
+            texto += f"• *{nombre}*: `{cid}`\n"
     else:
         texto += "_No hay canales registrados_\n"
     kb = [
@@ -316,7 +451,10 @@ def hacer_addcanal(update, context):
         return
     args = context.args
     if len(args) < 2:
-        update.message.reply_text("❌ Uso correcto: `/addcanal NombreCanal -100xxxxxxxxxx`", parse_mode="Markdown")
+        update.message.reply_text(
+            "❌ Uso correcto:\n`/addcanal NombreCanal -100xxxxxxxxxx`\n\nEjemplo:\n`/addcanal MiCanal -1001234567890`",
+            parse_mode="Markdown"
+        )
         return
     nombre = args[0]
     try:
@@ -328,9 +466,9 @@ def hacer_addcanal(update, context):
         safe_execute("INSERT INTO canales (nombre, canal_id) VALUES (%s, %s)", (nombre, canal_id))
         conn.commit()
         update.message.reply_text(f"✅ Canal *{nombre}* agregado correctamente.", parse_mode="Markdown")
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        update.message.reply_text(f"❌ Error: el nombre o ID ya existe.", parse_mode="Markdown")
+        update.message.reply_text("❌ Error: ese nombre o ID ya existe.", parse_mode="Markdown")
 
 def cmd_canales(update, context):
     if not update.effective_user or update.effective_user.id not in ADMINS:
@@ -352,7 +490,6 @@ def cmd_delcanal(update, context):
         update.message.reply_text("📭 No hay canales para eliminar.")
         return
     botones = [[InlineKeyboardButton(f"🗑 {n}", callback_data=f"delcanal_{n}")] for n in canales.keys()]
-    botones.append([InlineKeyboardButton("🔙 Cancelar", callback_data="menu_canales")])
     update.message.reply_text("Selecciona el canal a eliminar:", reply_markup=InlineKeyboardMarkup(botones))
 
 # ===== ENVÍO =====
@@ -421,7 +558,7 @@ def vista_previa(update, context):
         f"*Contenido:*\n{data_msg['contenido'] or '_(archivo multimedia)_'}"
     )
     kb = [
-        [InlineKeyboardButton("✅ Confirmar", callback_data="confirmar_envio")],
+        [InlineKeyboardButton("✅ Confirmar y programar", callback_data="confirmar_envio")],
         [InlineKeyboardButton("❌ Cancelar", callback_data="main_menu")]
     ]
     q.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
@@ -438,7 +575,7 @@ def botones(update, context):
         context.user_data.clear()
         kb = [
             [InlineKeyboardButton("📅 Programar mensaje", callback_data="prog")],
-            [InlineKeyboardButton("📋 Panel de mensajes", callback_data="panel")],
+            [InlineKeyboardButton("📋 Panel de mensajes", callback_data="panel_menu")],
             [InlineKeyboardButton("📢 Gestionar canales", callback_data="menu_canales")],
             [InlineKeyboardButton("📊 Estadísticas", callback_data="stats")]
         ]
@@ -467,11 +604,9 @@ def botones(update, context):
         hora = context.user_data.get("hora")
         canal = context.user_data.get("canal")
         data_msg = context.user_data.get("data")
-
         if not all([fecha, hora, canal, data_msg]):
             q.message.reply_text("❌ Error: faltan datos. Empieza de nuevo con /start")
             return
-
         fecha_final = f"{fecha} {hora}:{minuto}"
         context.user_data["fecha_final"] = fecha_final
         kb = [
@@ -491,18 +626,15 @@ def botones(update, context):
         canal = context.user_data.get("canal")
         data_msg = context.user_data.get("data")
         recurrente = context.user_data.get("recurrente")
-
         try:
             fecha_dt = TIMEZONE.localize(datetime.strptime(fecha_final, "%Y-%m-%d %H:%M"))
         except Exception:
             q.message.reply_text("❌ Error al procesar la fecha.")
             return
-
         delay = (fecha_dt - datetime.now(TIMEZONE)).total_seconds()
         if delay <= 0:
             q.message.reply_text("❌ La fecha ya pasó. Selecciona una fecha futura.")
             return
-
         id_msg = guardar(data_msg["tipo"], data_msg["contenido"], data_msg["file_id"], fecha_final, canal, recurrente)
         context.job_queue.run_once(
             enviar,
@@ -513,19 +645,39 @@ def botones(update, context):
         q.message.reply_text(f"✅ *Programado para {fecha_final}*{rec_txt}", parse_mode="Markdown")
         context.user_data.clear()
 
-    elif data == "panel":
+    elif data == "panel_menu":
+        panel_menu(update, context)
+
+    elif data == "panel_filter_todos":
         context.user_data["panel_page"] = 0
-        panel(update, context)
+        panel(update, context, filtro="todos")
+
+    elif data == "panel_filter_pendientes":
+        context.user_data["panel_page"] = 0
+        panel(update, context, filtro="pendientes")
+
+    elif data == "panel_filter_enviados":
+        context.user_data["panel_page"] = 0
+        panel(update, context, filtro="enviados")
+
+    elif data == "panel_filter_recurrentes":
+        context.user_data["panel_page"] = 0
+        panel(update, context, filtro="recurrentes")
 
     elif data.startswith("panel_page_"):
         context.user_data["panel_page"] = int(data.split("_")[2])
-        panel(update, context)
+        filtro = context.user_data.get("panel_filtro", "todos")
+        panel(update, context, filtro=filtro)
+
+    elif data.startswith("detalle_"):
+        id_msg = int(data.split("_")[1])
+        ver_detalle(update, context, id_msg)
 
     elif data.startswith("confirm_del_"):
         id_msg = int(data.split("_")[2])
         kb = [[
             InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"del_{id_msg}"),
-            InlineKeyboardButton("❌ Cancelar", callback_data="panel")
+            InlineKeyboardButton("❌ Cancelar", callback_data="panel_menu")
         ]]
         q.message.reply_text("⚠️ ¿Seguro que quieres eliminar este mensaje?", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -536,7 +688,7 @@ def botones(update, context):
     elif data.startswith("edit_"):
         id_msg = int(data.split("_")[1])
         context.user_data["editando_id"] = id_msg
-        q.message.reply_text("✏️ Envíame el nuevo texto para este mensaje:", parse_mode="Markdown")
+        q.message.reply_text("✏️ Envíame el nuevo texto para este mensaje:")
 
     elif data == "stats":
         q.message.reply_text(estadisticas(), parse_mode="Markdown")
@@ -584,7 +736,6 @@ def recibir(update, context):
         return
     if not update.message:
         return
-
     msg = update.message
 
     if "editando_id" in context.user_data:
@@ -645,10 +796,31 @@ def cmd_errores(update, context):
         texto += f"• {e[1]}: `{str(e[2])[:80]}`\n"
     update.message.reply_text(texto, parse_mode="Markdown")
 
+def cmd_limpiar(update, context):
+    if not update.effective_user or update.effective_user.id not in ADMINS:
+        return
+    try:
+        fecha_limite = (datetime.now(TIMEZONE) - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
+        safe_execute("DELETE FROM mensajes WHERE enviado=TRUE AND fecha < %s", (fecha_limite,))
+        eliminados_msg = cursor.rowcount
+        safe_execute("DELETE FROM errores WHERE fecha < %s", (fecha_limite,))
+        eliminados_err = cursor.rowcount
+        conn.commit()
+        update.message.reply_text(
+            f"🧹 *Limpieza completada*\n\n"
+            f"🗑 Mensajes eliminados: {eliminados_msg}\n"
+            f"🚨 Errores eliminados: {eliminados_err}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log_error(e)
+        update.message.reply_text(f"❌ Error en limpieza: {e}")
+
 # ===== MAIN =====
 def main():
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
+    jq = updater.job_queue
 
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("addcanal", hacer_addcanal, pass_args=True))
@@ -656,8 +828,19 @@ def main():
     dp.add_handler(CommandHandler("delcanal", cmd_delcanal))
     dp.add_handler(CommandHandler("pendientes", cmd_pendientes))
     dp.add_handler(CommandHandler("errores", cmd_errores))
+    dp.add_handler(CommandHandler("limpiar", cmd_limpiar))
     dp.add_handler(CallbackQueryHandler(botones))
     dp.add_handler(MessageHandler(Filters.all & ~Filters.command, recibir))
+
+    # Limpieza automática cada día a medianoche
+    jq.run_daily(limpiar_viejos, time=datetime.strptime("00:00", "%H:%M").time())
+
+    # Resumen semanal todos los lunes a las 8am
+    jq.run_daily(
+        resumen_semanal,
+        time=datetime.strptime("08:00", "%H:%M").time(),
+        days=(0,)
+    )
 
     recuperar(dp)
     print("🚀 Bot iniciado correctamente", flush=True)
