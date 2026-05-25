@@ -410,15 +410,15 @@ def ver_detalle(update, context, id_msg):
     id, tipo, contenido, file_id, fecha, canal, enviado, recurrente = m
     estado = "✅ Enviado" if enviado else "⏳ Pendiente"
     rec = recurrente if recurrente else "No"
-    file_txt = f"\n*File ID:* `{file_id}`" if file_id else ""
+    file_txt = f"\n*File ID:* <code>{file_id}</code>" if file_id else ""
     texto = (
-        f"👁 *Detalle del mensaje #{id}*\n\n"
-        f"*Canal:* {canal}\n"
-        f"*Fecha:* {fecha}\n"
-        f"*Estado:* {estado}\n"
-        f"*Tipo:* {tipo}\n"
-        f"*Recurrente:* {rec}{file_txt}\n\n"
-        f"*Contenido completo:*\n{contenido or '_(archivo multimedia)_'}"
+        f"👁 <b>Detalle del mensaje #{id}</b>\n\n"
+        f"<b>Canal:</b> {canal}\n"
+        f"<b>Fecha:</b> {fecha}\n"
+        f"<b>Estado:</b> {estado}\n"
+        f"<b>Tipo:</b> {tipo}\n"
+        f"<b>Recurrente:</b> {rec}{file_txt}\n\n"
+        f"<b>Contenido completo:</b>\n{contenido or '<i>(archivo multimedia)</i>'}"
     )
     kb = [[InlineKeyboardButton("🔙 Volver", callback_data=f"panel_filter_{context.user_data.get('panel_filtro', 'todos')}")]]
     if not enviado:
@@ -426,7 +426,7 @@ def ver_detalle(update, context, id_msg):
             InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{id}"),
             InlineKeyboardButton("❌ Eliminar", callback_data=f"confirm_del_{id}")
         ])
-    q.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    q.message.reply_text(texto, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 # ===== GESTIÓN DE CANALES =====
 def menu_canales(update, context):
@@ -533,11 +533,11 @@ def enviar(context):
 def enviar_tipo(bot, canal_id, data):
     try:
         if data["tipo"] == "texto":
-            bot.send_message(canal_id, data["contenido"])
+            bot.send_message(canal_id, data["contenido"], parse_mode="HTML")
         elif data["tipo"] == "foto":
-            bot.send_photo(canal_id, data["file_id"], caption=data["contenido"])
+            bot.send_photo(canal_id, data["file_id"], caption=data["contenido"], parse_mode="HTML")
         elif data["tipo"] == "video":
-            bot.send_video(canal_id, data["file_id"], caption=data["contenido"])
+            bot.send_video(canal_id, data["file_id"], caption=data["contenido"], parse_mode="HTML")
     except Exception as e:
         log_error(e)
         print(f"❌ Error enviando a {canal_id}: {e}", flush=True)
@@ -676,12 +676,12 @@ def botones(update, context):
     elif data.startswith("confirm_del_"):
         id_msg = int(data.split("_")[2])
         kb = [[
-            InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"del_{id_msg}"),
+            InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"eliminar_{id_msg}"),
             InlineKeyboardButton("❌ Cancelar", callback_data="panel_menu")
         ]]
         q.message.reply_text("⚠️ ¿Seguro que quieres eliminar este mensaje?", reply_markup=InlineKeyboardMarkup(kb))
 
-    elif data.startswith("del_") and not data.startswith("delcanal_"):
+    elif data.startswith("eliminar_"):
         eliminar(int(data.split("_")[1]))
         q.message.reply_text("🗑 Mensaje eliminado correctamente.")
 
@@ -742,7 +742,7 @@ def recibir(update, context):
         if msg.text and not msg.text.startswith("/"):
             id_msg = context.user_data.pop("editando_id")
             context.user_data["editando_id_confirmado"] = id_msg
-            context.user_data["editando_contenido"] = msg.text
+            context.user_data["editando_contenido"] = msg.text_html
             msg.reply_text("📅 Ahora selecciona la nueva fecha:")
             calendario(update, context)
         return
@@ -751,19 +751,23 @@ def recibir(update, context):
         return
 
     if msg.text and not msg.text.startswith("/"):
-        context.user_data["data"] = {"tipo": "texto", "contenido": msg.text, "file_id": None}
+        context.user_data["data"] = {
+            "tipo": "texto",
+            "contenido": msg.text_html,
+            "file_id": None
+        }
         calendario(update, context)
     elif msg.photo:
         context.user_data["data"] = {
             "tipo": "foto",
-            "contenido": msg.caption or "",
+            "contenido": msg.caption_html or "",
             "file_id": msg.photo[-1].file_id
         }
         calendario(update, context)
     elif msg.video:
         context.user_data["data"] = {
             "tipo": "video",
-            "contenido": msg.caption or "",
+            "contenido": msg.caption_html or "",
             "file_id": msg.video.file_id
         }
         calendario(update, context)
@@ -832,10 +836,7 @@ def main():
     dp.add_handler(CallbackQueryHandler(botones))
     dp.add_handler(MessageHandler(Filters.all & ~Filters.command, recibir))
 
-    # Limpieza automática cada día a medianoche
     jq.run_daily(limpiar_viejos, time=datetime.strptime("00:00", "%H:%M").time())
-
-    # Resumen semanal todos los lunes a las 8am
     jq.run_daily(
         resumen_semanal,
         time=datetime.strptime("08:00", "%H:%M").time(),
@@ -844,7 +845,7 @@ def main():
 
     recuperar(dp)
     print("🚀 Bot iniciado correctamente", flush=True)
-    updater.start_polling()
+    updater.start_polling(drop_pending_updates=True)
     updater.idle()
 
 if __name__ == "__main__":
