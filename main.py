@@ -1,5 +1,7 @@
 import os
+import re
 import time
+import requests
 import psycopg2
 from psycopg2 import OperationalError
 from datetime import datetime, timedelta
@@ -16,6 +18,36 @@ DB_URL = ("postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@centerbeam.pro
 
 ADMINS = [5869414542]
 TIMEZONE = pytz.timezone("America/Bogota")
+
+# ===== TRADUCCIÓN =====
+def traducir(texto, destino):
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {"client": "gtx", "sl": "es", "tl": destino, "dt": "t", "q": texto}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        data = r.json()
+        return "".join([s[0] for s in data[0] if s[0]])
+    except Exception as e:
+        print(f"❌ Error traduciendo a {destino}: {e}", flush=True)
+        return texto
+
+def extraer_emojis(texto):
+    emoji_pattern = re.compile(
+        "[\U00010000-\U0010ffff\U00002600-\U000027BF"
+        "\U0001f300-\U0001f5ff\U0001f600-\U0001f64f"
+        "\U0001f680-\U0001f6ff\U00002702-\U000027B0]+",
+        flags=re.UNICODE
+    )
+    emojis = emoji_pattern.findall(texto)
+    return " ".join(emojis) if emojis else ""
+
+def construir_mensaje_trilingue(texto_es):
+    emojis = extraer_emojis(texto_es)
+    prefix = f"{emojis} " if emojis else ""
+    texto_en = traducir(texto_es, "en")
+    texto_it = traducir(texto_es, "it")
+    return f"{prefix}{texto_es}\n\n{prefix}{texto_en}\n\n{prefix}{texto_it}"
 
 # ===== CONEXIÓN DB =====
 def get_connection():
@@ -43,11 +75,17 @@ cursor.execute("""
         fecha TEXT,
         canal TEXT,
         enviado BOOLEAN DEFAULT FALSE,
-        recurrente TEXT DEFAULT NULL
+        recurrente TEXT DEFAULT NULL,
+        origin_chat_id BIGINT DEFAULT NULL,
+        origin_msg_id BIGINT DEFAULT NULL,
+        traducir BOOLEAN DEFAULT FALSE
     )
 """)
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS recurrente TEXT DEFAULT NULL")
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS enviado BOOLEAN DEFAULT FALSE")
+cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS origin_chat_id BIGINT DEFAULT NULL")
+cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS origin_msg_id BIGINT DEFAULT NULL")
+cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS traducir BOOLEAN DEFAULT FALSE")
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS canales (
@@ -79,7 +117,6 @@ if cursor.fetchone()[0] == 0:
             "INSERT INTO canales (nombre, canal_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
             (nombre, cid)
         )
-
 conn.commit()
 
 # ===== UTILIDADES DB =====
@@ -105,29 +142,29 @@ def get_canales():
     return {row[0]: row[1] for row in cursor.fetchall()}
 
 # ===== FUNCIONES MENSAJES =====
-def guardar(tipo, contenido, file_id, fecha, canal, recurrente=None):
+def guardar(tipo, contenido, file_id, fecha, canal, recurrente=None,
+            origin_chat_id=None, origin_msg_id=None, traducir_msg=False):
     safe_execute(
-        "INSERT INTO mensajes (tipo, contenido, file_id, fecha, canal, recurrente) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-        (tipo, contenido, file_id, fecha, canal, recurrente)
+        """INSERT INTO mensajes
+           (tipo, contenido, file_id, fecha, canal, recurrente, origin_chat_id, origin_msg_id, traducir)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (tipo, contenido, file_id, fecha, canal, recurrente,
+         origin_chat_id, origin_msg_id, traducir_msg)
     )
     id_msg = cursor.fetchone()[0]
     conn.commit()
     return id_msg
 
-def obtener(solo_pendientes=False, solo_enviados=False, solo_recurrentes=False, canal_filtro=None):
+def obtener(solo_pendientes=False, solo_enviados=False, solo_recurrentes=False):
     condiciones = []
-    params = []
     if solo_pendientes:
         condiciones.append("enviado=FALSE")
     if solo_enviados:
         condiciones.append("enviado=TRUE")
     if solo_recurrentes:
         condiciones.append("recurrente IS NOT NULL")
-    if canal_filtro:
-        condiciones.append("canal=%s")
-        params.append(canal_filtro)
     where = f"WHERE {' AND '.join(condiciones)}" if condiciones else ""
-    safe_execute(f"SELECT * FROM mensajes {where} ORDER BY id DESC", params)
+    safe_execute(f"SELECT * FROM mensajes {where} ORDER BY id DESC")
     return cursor.fetchall()
 
 def eliminar(id):
@@ -135,10 +172,7 @@ def eliminar(id):
     conn.commit()
 
 def actualizar_mensaje(id, contenido, fecha):
-    safe_execute(
-        "UPDATE mensajes SET contenido=%s, fecha=%s WHERE id=%s",
-        (contenido, fecha, id)
-    )
+    safe_execute("UPDATE mensajes SET contenido=%s, fecha=%s WHERE id=%s", (contenido, fecha, id))
     conn.commit()
 
 # ===== LIMPIEZA AUTOMÁTICA =====
@@ -171,26 +205,18 @@ def resumen_semanal(context):
         n_canales = cursor.fetchone()[0]
         safe_execute("SELECT COUNT(*) FROM errores")
         n_errores = cursor.fetchone()[0]
-
-        top_txt = ""
-        for canal, count in top_canales:
-            top_txt += f"  • {canal}: {count} mensajes\n"
-
+        top_txt = "".join([f"  • {c}: {n} mensajes\n" for c, n in top_canales])
         texto = (
             f"📊 *Resumen Semanal — Bot PRO*\n"
             f"_{datetime.now(TIMEZONE).strftime('%d/%m/%Y')}_\n\n"
-            f"📨 Total mensajes: {total}\n"
-            f"✅ Enviados: {enviados}\n"
-            f"⏳ Pendientes: {pendientes}\n"
-            f"🔁 Recurrentes activos: {recurrentes}\n"
-            f"📢 Canales registrados: {n_canales}\n"
-            f"🚨 Errores registrados: {n_errores}\n\n"
-            f"🏆 *Top canales:*\n{top_txt if top_txt else '  Sin datos aún'}"
+            f"📨 Total: {total} | ✅ Enviados: {enviados}\n"
+            f"⏳ Pendientes: {pendientes} | 🔁 Recurrentes: {recurrentes}\n"
+            f"📢 Canales: {n_canales} | 🚨 Errores: {n_errores}\n\n"
+            f"🏆 *Top canales:*\n{top_txt or '  Sin datos aún'}"
         )
-        bot = context.bot
         for admin_id in ADMINS:
             try:
-                bot.send_message(admin_id, texto, parse_mode="Markdown")
+                context.bot.send_message(admin_id, texto, parse_mode="Markdown")
             except Exception as e:
                 log_error(e)
     except Exception as e:
@@ -243,7 +269,7 @@ def grafico():
 def recuperar(dispatcher):
     safe_execute("SELECT * FROM mensajes WHERE enviado=FALSE")
     for m in cursor.fetchall():
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente = m
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, origin_chat_id, origin_msg_id, traducir_msg = m
         try:
             fecha_dt = TIMEZONE.localize(datetime.strptime(fecha, "%Y-%m-%d %H:%M"))
         except Exception:
@@ -257,7 +283,8 @@ def recuperar(dispatcher):
             context={
                 "id": id, "tipo": tipo, "contenido": contenido,
                 "file_id": file_id, "canal": canal, "recurrente": recurrente,
-                "fecha_str": fecha
+                "fecha_str": fecha, "origin_chat_id": origin_chat_id,
+                "origin_msg_id": origin_msg_id, "traducir": traducir_msg
             }
         )
 
@@ -321,8 +348,7 @@ def start(update, context):
     ]
     update.message.reply_text(
         "🔥 *BOT PRO* — Panel de control\n\nSelecciona una opción:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
     )
 
 # ===== PANEL CON FILTROS =====
@@ -336,14 +362,14 @@ def panel_menu(update, context):
         [InlineKeyboardButton("🔁 Recurrentes", callback_data="panel_filter_recurrentes")],
         [InlineKeyboardButton("🔙 Menú principal", callback_data="main_menu")]
     ]
-    q.message.reply_text("📋 *Panel de mensajes*\n\n¿Qué quieres ver?", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    q.message.reply_text("📋 *Panel de mensajes*\n\n¿Qué quieres ver?",
+                         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 def panel(update, context, filtro="todos"):
     q = update.callback_query
     q.answer()
     page = context.user_data.get("panel_page", 0)
     context.user_data["panel_filtro"] = filtro
-
     if filtro == "pendientes":
         datos = obtener(solo_pendientes=True)
     elif filtro == "enviados":
@@ -352,31 +378,30 @@ def panel(update, context, filtro="todos"):
         datos = obtener(solo_recurrentes=True)
     else:
         datos = obtener()
-
     total = len(datos)
     por_pagina = 5
     inicio = page * por_pagina
     fin = inicio + por_pagina
     pagina = datos[inicio:fin]
-
     if not pagina:
         kb = [[InlineKeyboardButton("🔙 Volver", callback_data="panel_menu")]]
-        q.message.reply_text("📭 No hay mensajes en esta categoría.", reply_markup=InlineKeyboardMarkup(kb))
+        q.message.reply_text("📭 No hay mensajes en esta categoría.",
+                             reply_markup=InlineKeyboardMarkup(kb))
         return
-
-    filtro_txt = {"todos": "Todos", "pendientes": "⏳ Pendientes", "enviados": "✅ Enviados", "recurrentes": "🔁 Recurrentes"}
-    q.message.reply_text(f"*{filtro_txt.get(filtro, 'Todos')}* — Página {page+1} | Total: {total}", parse_mode="Markdown")
-
+    filtro_txt = {"todos": "Todos", "pendientes": "⏳ Pendientes",
+                  "enviados": "✅ Enviados", "recurrentes": "🔁 Recurrentes"}
+    q.message.reply_text(
+        f"*{filtro_txt.get(filtro, 'Todos')}* — Página {page+1} | Total: {total}",
+        parse_mode="Markdown"
+    )
     for m in pagina:
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente = m
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg = m
         estado = "✅ Enviado" if enviado else "⏳ Pendiente"
         rec = f" | 🔁 {recurrente}" if recurrente else ""
+        trad = " | 🌐" if traducir_msg else ""
         texto = (
-            f"*ID:* {id}\n"
-            f"*Canal:* {canal}\n"
-            f"*Fecha:* {fecha}\n"
-            f"*Estado:* {estado}{rec}\n"
-            f"*Tipo:* {tipo}"
+            f"*ID:* {id}\n*Canal:* {canal}\n"
+            f"*Fecha:* {fecha}\n*Estado:* {estado}{rec}{trad}\n*Tipo:* {tipo}"
         )
         kb = [[InlineKeyboardButton("👁 Ver detalle", callback_data=f"detalle_{id}")]]
         if not enviado:
@@ -387,7 +412,6 @@ def panel(update, context, filtro="todos"):
         else:
             kb.append([InlineKeyboardButton("❌ Eliminar", callback_data=f"confirm_del_{id}")])
         q.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"panel_page_{page-1}"))
@@ -407,20 +431,18 @@ def ver_detalle(update, context, id_msg):
     if not m:
         q.message.reply_text("❌ Mensaje no encontrado.")
         return
-    id, tipo, contenido, file_id, fecha, canal, enviado, recurrente = m
+    id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg = m
     estado = "✅ Enviado" if enviado else "⏳ Pendiente"
-    rec = recurrente if recurrente else "No"
-    file_txt = f"\n*File ID:* <code>{file_id}</code>" if file_id else ""
     texto = (
-        f"👁 <b>Detalle del mensaje #{id}</b>\n\n"
-        f"<b>Canal:</b> {canal}\n"
-        f"<b>Fecha:</b> {fecha}\n"
-        f"<b>Estado:</b> {estado}\n"
-        f"<b>Tipo:</b> {tipo}\n"
-        f"<b>Recurrente:</b> {rec}{file_txt}\n\n"
-        f"<b>Contenido completo:</b>\n{contenido or '<i>(archivo multimedia)</i>'}"
+        f"👁 <b>Detalle #{id}</b>\n\n"
+        f"<b>Canal:</b> {canal}\n<b>Fecha:</b> {fecha}\n"
+        f"<b>Estado:</b> {estado}\n<b>Tipo:</b> {tipo}\n"
+        f"<b>Recurrente:</b> {recurrente or 'No'}\n"
+        f"<b>Trilingüe:</b> {'Sí 🌐' if traducir_msg else 'No'}\n\n"
+        f"<b>Contenido:</b>\n{contenido or '<i>(archivo multimedia)</i>'}"
     )
-    kb = [[InlineKeyboardButton("🔙 Volver", callback_data=f"panel_filter_{context.user_data.get('panel_filtro', 'todos')}")]]
+    kb = [[InlineKeyboardButton("🔙 Volver",
+           callback_data=f"panel_filter_{context.user_data.get('panel_filtro', 'todos')}")]]
     if not enviado:
         kb.insert(0, [
             InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{id}"),
@@ -434,11 +456,7 @@ def menu_canales(update, context):
     q.answer()
     canales = get_canales()
     texto = "📢 *Canales registrados:*\n\n"
-    if canales:
-        for nombre, cid in canales.items():
-            texto += f"• *{nombre}*: `{cid}`\n"
-    else:
-        texto += "_No hay canales registrados_\n"
+    texto += "".join([f"• *{n}*: `{c}`\n" for n, c in canales.items()]) if canales else "_Sin canales_\n"
     kb = [
         [InlineKeyboardButton("➕ Agregar canal", callback_data="add_canal")],
         [InlineKeyboardButton("🗑 Eliminar canal", callback_data="del_canal_menu")],
@@ -452,23 +470,21 @@ def hacer_addcanal(update, context):
     args = context.args
     if len(args) < 2:
         update.message.reply_text(
-            "❌ Uso correcto:\n`/addcanal NombreCanal -100xxxxxxxxxx`\n\nEjemplo:\n`/addcanal MiCanal -1001234567890`",
-            parse_mode="Markdown"
-        )
+            "❌ Uso:\n`/addcanal NombreCanal -100xxxxxxxxxx`", parse_mode="Markdown")
         return
     nombre = args[0]
     try:
         canal_id = int(args[1])
     except ValueError:
-        update.message.reply_text("❌ El ID debe ser un número. Ejemplo: `-1001234567890`", parse_mode="Markdown")
+        update.message.reply_text("❌ El ID debe ser número.", parse_mode="Markdown")
         return
     try:
         safe_execute("INSERT INTO canales (nombre, canal_id) VALUES (%s, %s)", (nombre, canal_id))
         conn.commit()
-        update.message.reply_text(f"✅ Canal *{nombre}* agregado correctamente.", parse_mode="Markdown")
+        update.message.reply_text(f"✅ Canal *{nombre}* agregado.", parse_mode="Markdown")
     except Exception:
         conn.rollback()
-        update.message.reply_text("❌ Error: ese nombre o ID ya existe.", parse_mode="Markdown")
+        update.message.reply_text("❌ Ese nombre o ID ya existe.", parse_mode="Markdown")
 
 def cmd_canales(update, context):
     if not update.effective_user or update.effective_user.id not in ADMINS:
@@ -477,9 +493,7 @@ def cmd_canales(update, context):
     if not canales:
         update.message.reply_text("📭 No hay canales registrados.")
         return
-    texto = "📢 *Canales registrados:*\n\n"
-    for nombre, cid in canales.items():
-        texto += f"• *{nombre}*: `{cid}`\n"
+    texto = "📢 *Canales:*\n\n" + "".join([f"• *{n}*: `{c}`\n" for n, c in canales.items()])
     update.message.reply_text(texto, parse_mode="Markdown")
 
 def cmd_delcanal(update, context):
@@ -489,8 +503,8 @@ def cmd_delcanal(update, context):
     if not canales:
         update.message.reply_text("📭 No hay canales para eliminar.")
         return
-    botones = [[InlineKeyboardButton(f"🗑 {n}", callback_data=f"delcanal_{n}")] for n in canales.keys()]
-    update.message.reply_text("Selecciona el canal a eliminar:", reply_markup=InlineKeyboardMarkup(botones))
+    botones = [[InlineKeyboardButton(f"🗑 {n}", callback_data=f"delcanal_{n}")] for n in canales]
+    update.message.reply_text("Selecciona el canal:", reply_markup=InlineKeyboardMarkup(botones))
 
 # ===== ENVÍO =====
 def enviar(context):
@@ -501,37 +515,38 @@ def enviar(context):
         if data["canal"] == "ALL":
             for canal_id in canales.values():
                 enviar_tipo(bot, canal_id, data)
-        else:
-            if data["canal"] in canales:
-                enviar_tipo(bot, canales[data["canal"]], data)
+        elif data["canal"] in canales:
+            enviar_tipo(bot, canales[data["canal"]], data)
         safe_execute("UPDATE mensajes SET enviado=TRUE WHERE id=%s", (data["id"],))
         conn.commit()
-
         if data.get("recurrente"):
             recurrente = data["recurrente"]
             fecha_actual = datetime.strptime(data["fecha_str"], "%Y-%m-%d %H:%M")
-            if recurrente == "diario":
-                nueva_fecha = fecha_actual + timedelta(days=1)
-            elif recurrente == "semanal":
-                nueva_fecha = fecha_actual + timedelta(weeks=1)
-            else:
-                return
+            nueva_fecha = fecha_actual + (timedelta(days=1) if recurrente == "diario" else timedelta(weeks=1))
             nueva_fecha_str = nueva_fecha.strftime("%Y-%m-%d %H:%M")
-            nuevo_id = guardar(data["tipo"], data["contenido"], data["file_id"], nueva_fecha_str, data["canal"], recurrente)
-            nueva_fecha_dt = TIMEZONE.localize(nueva_fecha)
-            delay = (nueva_fecha_dt - datetime.now(TIMEZONE)).total_seconds()
+            nuevo_id = guardar(
+                data["tipo"], data["contenido"], data["file_id"],
+                nueva_fecha_str, data["canal"], recurrente,
+                data.get("origin_chat_id"), data.get("origin_msg_id"),
+                data.get("traducir", False)
+            )
+            delay = (TIMEZONE.localize(nueva_fecha) - datetime.now(TIMEZONE)).total_seconds()
             if delay > 0:
-                context.job_queue.run_once(
-                    enviar,
-                    when=delay,
-                    context={**data, "id": nuevo_id, "fecha_str": nueva_fecha_str}
-                )
+                context.job_queue.run_once(enviar, when=delay,
+                                           context={**data, "id": nuevo_id, "fecha_str": nueva_fecha_str})
     except Exception as e:
         log_error(e)
         print(f"❌ Error en envío: {e}", flush=True)
 
 def enviar_tipo(bot, canal_id, data):
     try:
+        if data.get("traducir") and data["tipo"] == "texto":
+            bot.send_message(canal_id, construir_mensaje_trilingue(data["contenido"]))
+            return
+        if data.get("origin_chat_id") and data.get("origin_msg_id"):
+            bot.copy_message(chat_id=canal_id, from_chat_id=data["origin_chat_id"],
+                            message_id=data["origin_msg_id"])
+            return
         if data["tipo"] == "texto":
             bot.send_message(canal_id, data["contenido"], parse_mode="HTML")
         elif data["tipo"] == "foto":
@@ -548,12 +563,13 @@ def vista_previa(update, context):
     data_msg = context.user_data.get("data")
     canal = context.user_data.get("canal", "?")
     fecha = context.user_data.get("fecha_final", "?")
-    recurrente = context.user_data.get("recurrente", None)
+    recurrente = context.user_data.get("recurrente")
+    traducir_msg = context.user_data.get("traducir", False)
     rec_txt = f"\n🔁 Recurrencia: {recurrente}" if recurrente else ""
+    trad_txt = "\n🌐 Se enviará en ES / EN / IT" if traducir_msg else ""
     texto = (
         f"👁 *Vista previa*\n\n"
-        f"📢 Canal: {canal}\n"
-        f"📅 Fecha: {fecha}{rec_txt}\n"
+        f"📢 Canal: {canal}\n📅 Fecha: {fecha}{rec_txt}{trad_txt}\n"
         f"📝 Tipo: {data_msg['tipo']}\n\n"
         f"*Contenido:*\n{data_msg['contenido'] or '_(archivo multimedia)_'}"
     )
@@ -579,18 +595,19 @@ def botones(update, context):
             [InlineKeyboardButton("📢 Gestionar canales", callback_data="menu_canales")],
             [InlineKeyboardButton("📊 Estadísticas", callback_data="stats")]
         ]
-        q.message.reply_text("🔥 *BOT PRO* — Panel de control", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        q.message.reply_text("🔥 *BOT PRO* — Panel de control",
+                             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == "prog":
         canales = get_canales()
-        kb = [[InlineKeyboardButton(c, callback_data=f"canal_{c}")] for c in canales.keys()]
+        kb = [[InlineKeyboardButton(c, callback_data=f"canal_{c}")] for c in canales]
         kb.append([InlineKeyboardButton("🔥 TODOS LOS CANALES", callback_data="canal_ALL")])
         kb.append([InlineKeyboardButton("🔙 Menú principal", callback_data="main_menu")])
         q.message.reply_text("📢 Selecciona el canal:", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("canal_"):
         context.user_data["canal"] = data.replace("canal_", "", 1)
-        q.message.reply_text("📨 Envíame el contenido que quieres programar\n_(texto, foto o video)_", parse_mode="Markdown")
+        q.message.reply_text("📨 Envíame el contenido\n_(texto, foto o video)_", parse_mode="Markdown")
 
     elif data.startswith("fecha_"):
         mostrar_horas(update, context)
@@ -605,10 +622,9 @@ def botones(update, context):
         canal = context.user_data.get("canal")
         data_msg = context.user_data.get("data")
         if not all([fecha, hora, canal, data_msg]):
-            q.message.reply_text("❌ Error: faltan datos. Empieza de nuevo con /start")
+            q.message.reply_text("❌ Faltan datos. Empieza de nuevo con /start")
             return
-        fecha_final = f"{fecha} {hora}:{minuto}"
-        context.user_data["fecha_final"] = fecha_final
+        context.user_data["fecha_final"] = f"{fecha} {hora}:{minuto}"
         kb = [
             [InlineKeyboardButton("📅 Solo una vez", callback_data="rec_none")],
             [InlineKeyboardButton("🔁 Diario", callback_data="rec_diario")],
@@ -617,8 +633,27 @@ def botones(update, context):
         q.message.reply_text("🔁 ¿Con qué frecuencia?", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("rec_"):
-        recurrente = None if data == "rec_none" else data.replace("rec_", "")
-        context.user_data["recurrente"] = recurrente
+        context.user_data["recurrente"] = None if data == "rec_none" else data.replace("rec_", "")
+        data_msg = context.user_data.get("data", {})
+        if data_msg.get("tipo") == "texto":
+            kb = [
+                [InlineKeyboardButton("🌐 Sí, traducir (ES / EN / IT)", callback_data="trad_si")],
+                [InlineKeyboardButton("❌ No, solo español", callback_data="trad_no")]
+            ]
+            q.message.reply_text(
+                "🌐 ¿Enviar en 3 idiomas?\n_Español, Inglés e Italiano_",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
+            )
+        else:
+            context.user_data["traducir"] = False
+            vista_previa(update, context)
+
+    elif data == "trad_si":
+        context.user_data["traducir"] = True
+        vista_previa(update, context)
+
+    elif data == "trad_no":
+        context.user_data["traducir"] = False
         vista_previa(update, context)
 
     elif data == "confirmar_envio":
@@ -626,6 +661,7 @@ def botones(update, context):
         canal = context.user_data.get("canal")
         data_msg = context.user_data.get("data")
         recurrente = context.user_data.get("recurrente")
+        traducir_msg = context.user_data.get("traducir", False)
         try:
             fecha_dt = TIMEZONE.localize(datetime.strptime(fecha_final, "%Y-%m-%d %H:%M"))
         except Exception:
@@ -633,95 +669,82 @@ def botones(update, context):
             return
         delay = (fecha_dt - datetime.now(TIMEZONE)).total_seconds()
         if delay <= 0:
-            q.message.reply_text("❌ La fecha ya pasó. Selecciona una fecha futura.")
+            q.message.reply_text("❌ La fecha ya pasó.")
             return
-        id_msg = guardar(data_msg["tipo"], data_msg["contenido"], data_msg["file_id"], fecha_final, canal, recurrente)
+        id_msg = guardar(
+            data_msg["tipo"], data_msg["contenido"], data_msg["file_id"],
+            fecha_final, canal, recurrente,
+            data_msg.get("origin_chat_id"), data_msg.get("origin_msg_id"), traducir_msg
+        )
         context.job_queue.run_once(
-            enviar,
-            when=delay,
-            context={**data_msg, "canal": canal, "id": id_msg, "recurrente": recurrente, "fecha_str": fecha_final}
+            enviar, when=delay,
+            context={**data_msg, "canal": canal, "id": id_msg,
+                     "recurrente": recurrente, "fecha_str": fecha_final, "traducir": traducir_msg}
         )
         rec_txt = f" | 🔁 {recurrente}" if recurrente else ""
-        q.message.reply_text(f"✅ *Programado para {fecha_final}*{rec_txt}", parse_mode="Markdown")
+        trad_txt = " | 🌐 Trilingüe" if traducir_msg else ""
+        q.message.reply_text(f"✅ *Programado para {fecha_final}*{rec_txt}{trad_txt}",
+                             parse_mode="Markdown")
         context.user_data.clear()
 
     elif data == "panel_menu":
         panel_menu(update, context)
-
     elif data == "panel_filter_todos":
         context.user_data["panel_page"] = 0
         panel(update, context, filtro="todos")
-
     elif data == "panel_filter_pendientes":
         context.user_data["panel_page"] = 0
         panel(update, context, filtro="pendientes")
-
     elif data == "panel_filter_enviados":
         context.user_data["panel_page"] = 0
         panel(update, context, filtro="enviados")
-
     elif data == "panel_filter_recurrentes":
         context.user_data["panel_page"] = 0
         panel(update, context, filtro="recurrentes")
-
     elif data.startswith("panel_page_"):
         context.user_data["panel_page"] = int(data.split("_")[2])
-        filtro = context.user_data.get("panel_filtro", "todos")
-        panel(update, context, filtro=filtro)
-
+        panel(update, context, filtro=context.user_data.get("panel_filtro", "todos"))
     elif data.startswith("detalle_"):
-        id_msg = int(data.split("_")[1])
-        ver_detalle(update, context, id_msg)
-
+        ver_detalle(update, context, int(data.split("_")[1]))
     elif data.startswith("confirm_del_"):
         id_msg = int(data.split("_")[2])
         kb = [[
             InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"eliminar_{id_msg}"),
             InlineKeyboardButton("❌ Cancelar", callback_data="panel_menu")
         ]]
-        q.message.reply_text("⚠️ ¿Seguro que quieres eliminar este mensaje?", reply_markup=InlineKeyboardMarkup(kb))
-
+        q.message.reply_text("⚠️ ¿Seguro?", reply_markup=InlineKeyboardMarkup(kb))
     elif data.startswith("eliminar_"):
         eliminar(int(data.split("_")[1]))
-        q.message.reply_text("🗑 Mensaje eliminado correctamente.")
-
+        q.message.reply_text("🗑 Eliminado correctamente.")
     elif data.startswith("edit_"):
-        id_msg = int(data.split("_")[1])
-        context.user_data["editando_id"] = id_msg
-        q.message.reply_text("✏️ Envíame el nuevo texto para este mensaje:")
-
+        context.user_data["editando_id"] = int(data.split("_")[1])
+        q.message.reply_text("✏️ Envíame el nuevo texto:")
     elif data == "stats":
         q.message.reply_text(estadisticas(), parse_mode="Markdown")
         ruta = grafico()
         if ruta:
             q.message.reply_photo(open(ruta, "rb"))
-
     elif data == "menu_canales":
         menu_canales(update, context)
-
     elif data == "add_canal":
         q.message.reply_text(
-            "➕ Para agregar un canal usa:\n\n`/addcanal NombreCanal -100xxxxxxxxxx`\n\nEjemplo:\n`/addcanal MiCanal -1001234567890`",
-            parse_mode="Markdown"
-        )
-
+            "➕ Usa:\n`/addcanal NombreCanal -100xxxxxxxxxx`", parse_mode="Markdown")
     elif data == "del_canal_menu":
         canales = get_canales()
         if not canales:
-            q.message.reply_text("📭 No hay canales para eliminar.")
+            q.message.reply_text("📭 No hay canales.")
             return
-        botones_list = [[InlineKeyboardButton(f"🗑 {n}", callback_data=f"delcanal_{n}")] for n in canales.keys()]
-        botones_list.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_canales")])
-        q.message.reply_text("Selecciona el canal a eliminar:", reply_markup=InlineKeyboardMarkup(botones_list))
-
+        blist = [[InlineKeyboardButton(f"🗑 {n}", callback_data=f"delcanal_{n}")] for n in canales]
+        blist.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_canales")])
+        q.message.reply_text("Selecciona:", reply_markup=InlineKeyboardMarkup(blist))
     elif data.startswith("delcanal_"):
         nombre = data.replace("delcanal_", "", 1)
         kb = [[
-            InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"confirmar_delcanal_{nombre}"),
-            InlineKeyboardButton("❌ Cancelar", callback_data="menu_canales")
+            InlineKeyboardButton("✅ Sí", callback_data=f"confirmar_delcanal_{nombre}"),
+            InlineKeyboardButton("❌ No", callback_data="menu_canales")
         ]]
-        q.message.reply_text(f"⚠️ ¿Eliminar el canal *{nombre}*?", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
+        q.message.reply_text(f"⚠️ ¿Eliminar *{nombre}*?",
+                             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     elif data.startswith("confirmar_delcanal_"):
         nombre = data.replace("confirmar_delcanal_", "", 1)
         safe_execute("DELETE FROM canales WHERE nombre=%s", (nombre,))
@@ -730,9 +753,7 @@ def botones(update, context):
 
 # ===== RECIBIR MENSAJES =====
 def recibir(update, context):
-    if not update.effective_user:
-        return
-    if update.effective_user.id not in ADMINS:
+    if not update.effective_user or update.effective_user.id not in ADMINS:
         return
     if not update.message:
         return
@@ -741,9 +762,8 @@ def recibir(update, context):
     if "editando_id" in context.user_data:
         if msg.text and not msg.text.startswith("/"):
             id_msg = context.user_data.pop("editando_id")
-            context.user_data["editando_id_confirmado"] = id_msg
             context.user_data["editando_contenido"] = msg.text_html
-            msg.reply_text("📅 Ahora selecciona la nueva fecha:")
+            msg.reply_text("📅 Selecciona la nueva fecha:")
             calendario(update, context)
         return
 
@@ -752,23 +772,22 @@ def recibir(update, context):
 
     if msg.text and not msg.text.startswith("/"):
         context.user_data["data"] = {
-            "tipo": "texto",
-            "contenido": msg.text_html,
-            "file_id": None
+            "tipo": "texto", "contenido": msg.text,
+            "file_id": None, "origin_chat_id": msg.chat_id, "origin_msg_id": msg.message_id
         }
         calendario(update, context)
     elif msg.photo:
         context.user_data["data"] = {
-            "tipo": "foto",
-            "contenido": msg.caption_html or "",
-            "file_id": msg.photo[-1].file_id
+            "tipo": "foto", "contenido": msg.caption_html or "",
+            "file_id": msg.photo[-1].file_id,
+            "origin_chat_id": msg.chat_id, "origin_msg_id": msg.message_id
         }
         calendario(update, context)
     elif msg.video:
         context.user_data["data"] = {
-            "tipo": "video",
-            "contenido": msg.caption_html or "",
-            "file_id": msg.video.file_id
+            "tipo": "video", "contenido": msg.caption_html or "",
+            "file_id": msg.video.file_id,
+            "origin_chat_id": msg.chat_id, "origin_msg_id": msg.message_id
         }
         calendario(update, context)
 
@@ -780,11 +799,10 @@ def cmd_pendientes(update, context):
     if not datos:
         update.message.reply_text("✅ No hay mensajes pendientes.")
         return
-    texto = f"⏳ *{len(datos)} mensajes pendientes:*\n\n"
+    texto = f"⏳ *{len(datos)} pendientes:*\n\n"
     for m in datos[:10]:
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente = m
-        rec = " 🔁" if recurrente else ""
-        texto += f"• ID {id} | {canal} | {fecha}{rec}\n"
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg = m
+        texto += f"• ID {id} | {canal} | {fecha}{'🔁' if recurrente else ''}{'🌐' if traducir_msg else ''}\n"
     update.message.reply_text(texto, parse_mode="Markdown")
 
 def cmd_errores(update, context):
@@ -793,7 +811,7 @@ def cmd_errores(update, context):
     safe_execute("SELECT * FROM errores ORDER BY id DESC LIMIT 10")
     errores = cursor.fetchall()
     if not errores:
-        update.message.reply_text("✅ No hay errores registrados.")
+        update.message.reply_text("✅ No hay errores.")
         return
     texto = "🚨 *Últimos errores:*\n\n"
     for e in errores:
@@ -806,19 +824,17 @@ def cmd_limpiar(update, context):
     try:
         fecha_limite = (datetime.now(TIMEZONE) - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
         safe_execute("DELETE FROM mensajes WHERE enviado=TRUE AND fecha < %s", (fecha_limite,))
-        eliminados_msg = cursor.rowcount
+        msg = cursor.rowcount
         safe_execute("DELETE FROM errores WHERE fecha < %s", (fecha_limite,))
-        eliminados_err = cursor.rowcount
+        err = cursor.rowcount
         conn.commit()
         update.message.reply_text(
-            f"🧹 *Limpieza completada*\n\n"
-            f"🗑 Mensajes eliminados: {eliminados_msg}\n"
-            f"🚨 Errores eliminados: {eliminados_err}",
+            f"🧹 *Limpieza completada*\n\n🗑 Mensajes: {msg}\n🚨 Errores: {err}",
             parse_mode="Markdown"
         )
     except Exception as e:
         log_error(e)
-        update.message.reply_text(f"❌ Error en limpieza: {e}")
+        update.message.reply_text(f"❌ Error: {e}")
 
 # ===== MAIN =====
 def main():
@@ -837,11 +853,7 @@ def main():
     dp.add_handler(MessageHandler(Filters.all & ~Filters.command, recibir))
 
     jq.run_daily(limpiar_viejos, time=datetime.strptime("00:00", "%H:%M").time())
-    jq.run_daily(
-        resumen_semanal,
-        time=datetime.strptime("08:00", "%H:%M").time(),
-        days=(0,)
-    )
+    jq.run_daily(resumen_semanal, time=datetime.strptime("08:00", "%H:%M").time(), days=(0,))
 
     recuperar(dp)
     print("🚀 Bot iniciado correctamente", flush=True)
