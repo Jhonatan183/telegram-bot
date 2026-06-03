@@ -9,7 +9,7 @@ import pytz
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
 # ===== CONFIG =====
@@ -18,6 +18,7 @@ DB_URL = ("postgresql://postgres:sRkjAQLlMcBIsShoIMpCSsPTklMOsvoj@centerbeam.pro
 
 ADMINS = [5869414542]
 TIMEZONE = pytz.timezone("America/Bogota")
+ALBUMS = {}  # almacena fotos de álbum temporalmente por user_id
 
 # ===== TRADUCCIÓN =====
 def traducir(texto, destino):
@@ -78,7 +79,8 @@ cursor.execute("""
         recurrente TEXT DEFAULT NULL,
         origin_chat_id BIGINT DEFAULT NULL,
         origin_msg_id BIGINT DEFAULT NULL,
-        traducir BOOLEAN DEFAULT FALSE
+        traducir BOOLEAN DEFAULT FALSE,
+        file_ids TEXT DEFAULT NULL
     )
 """)
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS recurrente TEXT DEFAULT NULL")
@@ -86,6 +88,7 @@ cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS enviado BOOLEAN DE
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS origin_chat_id BIGINT DEFAULT NULL")
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS origin_msg_id BIGINT DEFAULT NULL")
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS traducir BOOLEAN DEFAULT FALSE")
+cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS file_ids TEXT DEFAULT NULL")
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS canales (
@@ -143,13 +146,15 @@ def get_canales():
 
 # ===== FUNCIONES MENSAJES =====
 def guardar(tipo, contenido, file_id, fecha, canal, recurrente=None,
-            origin_chat_id=None, origin_msg_id=None, traducir_msg=False):
+            origin_chat_id=None, origin_msg_id=None, traducir_msg=False, file_ids=None):
+    file_ids_str = ",".join(file_ids) if file_ids else None
     safe_execute(
         """INSERT INTO mensajes
-           (tipo, contenido, file_id, fecha, canal, recurrente, origin_chat_id, origin_msg_id, traducir)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+           (tipo, contenido, file_id, fecha, canal, recurrente,
+            origin_chat_id, origin_msg_id, traducir, file_ids)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (tipo, contenido, file_id, fecha, canal, recurrente,
-         origin_chat_id, origin_msg_id, traducir_msg)
+         origin_chat_id, origin_msg_id, traducir_msg, file_ids_str)
     )
     id_msg = cursor.fetchone()[0]
     conn.commit()
@@ -269,7 +274,7 @@ def grafico():
 def recuperar(dispatcher):
     safe_execute("SELECT * FROM mensajes WHERE enviado=FALSE")
     for m in cursor.fetchall():
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, origin_chat_id, origin_msg_id, traducir_msg = m
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, origin_chat_id, origin_msg_id, traducir_msg, file_ids_str = m
         try:
             fecha_dt = TIMEZONE.localize(datetime.strptime(fecha, "%Y-%m-%d %H:%M"))
         except Exception:
@@ -277,12 +282,13 @@ def recuperar(dispatcher):
         delay = (fecha_dt - datetime.now(TIMEZONE)).total_seconds()
         if delay <= 0:
             continue
+        file_ids = file_ids_str.split(",") if file_ids_str else None
         dispatcher.job_queue.run_once(
-            enviar,
-            when=delay,
+            enviar, when=delay,
             context={
                 "id": id, "tipo": tipo, "contenido": contenido,
-                "file_id": file_id, "canal": canal, "recurrente": recurrente,
+                "file_id": file_id, "file_ids": file_ids,
+                "canal": canal, "recurrente": recurrente,
                 "fecha_str": fecha, "origin_chat_id": origin_chat_id,
                 "origin_msg_id": origin_msg_id, "traducir": traducir_msg
             }
@@ -395,13 +401,14 @@ def panel(update, context, filtro="todos"):
         parse_mode="Markdown"
     )
     for m in pagina:
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg = m
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str = m
         estado = "✅ Enviado" if enviado else "⏳ Pendiente"
         rec = f" | 🔁 {recurrente}" if recurrente else ""
         trad = " | 🌐" if traducir_msg else ""
+        n_fotos = f" | 📸{len(file_ids_str.split(','))}" if file_ids_str and tipo == "album" else ""
         texto = (
             f"*ID:* {id}\n*Canal:* {canal}\n"
-            f"*Fecha:* {fecha}\n*Estado:* {estado}{rec}{trad}\n*Tipo:* {tipo}"
+            f"*Fecha:* {fecha}\n*Estado:* {estado}{rec}{trad}{n_fotos}\n*Tipo:* {tipo}"
         )
         kb = [[InlineKeyboardButton("👁 Ver detalle", callback_data=f"detalle_{id}")]]
         if not enviado:
@@ -431,14 +438,16 @@ def ver_detalle(update, context, id_msg):
     if not m:
         q.message.reply_text("❌ Mensaje no encontrado.")
         return
-    id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg = m
+    id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str = m
     estado = "✅ Enviado" if enviado else "⏳ Pendiente"
+    n_fotos = f"\n<b>Fotos en álbum:</b> {len(file_ids_str.split(','))}" if file_ids_str and tipo == "album" else ""
     texto = (
         f"👁 <b>Detalle #{id}</b>\n\n"
         f"<b>Canal:</b> {canal}\n<b>Fecha:</b> {fecha}\n"
         f"<b>Estado:</b> {estado}\n<b>Tipo:</b> {tipo}\n"
         f"<b>Recurrente:</b> {recurrente or 'No'}\n"
-        f"<b>Trilingüe:</b> {'Sí 🌐' if traducir_msg else 'No'}\n\n"
+        f"<b>Trilingüe:</b> {'Sí 🌐' if traducir_msg else 'No'}"
+        f"{n_fotos}\n\n"
         f"<b>Contenido:</b>\n{contenido or '<i>(archivo multimedia)</i>'}"
     )
     kb = [[InlineKeyboardButton("🔙 Volver",
@@ -528,31 +537,73 @@ def enviar(context):
                 data["tipo"], data["contenido"], data["file_id"],
                 nueva_fecha_str, data["canal"], recurrente,
                 data.get("origin_chat_id"), data.get("origin_msg_id"),
-                data.get("traducir", False)
+                data.get("traducir", False), data.get("file_ids")
             )
             delay = (TIMEZONE.localize(nueva_fecha) - datetime.now(TIMEZONE)).total_seconds()
             if delay > 0:
-                context.job_queue.run_once(enviar, when=delay,
-                                           context={**data, "id": nuevo_id, "fecha_str": nueva_fecha_str})
+                context.job_queue.run_once(
+                    enviar, when=delay,
+                    context={**data, "id": nuevo_id, "fecha_str": nueva_fecha_str}
+                )
     except Exception as e:
         log_error(e)
         print(f"❌ Error en envío: {e}", flush=True)
 
 def enviar_tipo(bot, canal_id, data):
     try:
-        if data.get("traducir") and data["tipo"] == "texto":
+        usar_traduccion = data.get("traducir", False)
+
+        # ÁLBUM DE FOTOS
+        if data["tipo"] == "album":
+            fotos = data.get("file_ids") or []
+            caption = data.get("contenido", "") or ""
+            if usar_traduccion and caption:
+                caption = construir_mensaje_trilingue(caption)
+            media = []
+            for i, fid in enumerate(fotos):
+                if i == 0:
+                    media.append(InputMediaPhoto(fid, caption=caption))
+                else:
+                    media.append(InputMediaPhoto(fid))
+            if media:
+                bot.send_media_group(canal_id, media)
+            return
+
+        # TEXTO CON TRADUCCIÓN
+        if usar_traduccion and data["tipo"] == "texto":
             bot.send_message(canal_id, construir_mensaje_trilingue(data["contenido"]))
             return
-        if data.get("origin_chat_id") and data.get("origin_msg_id"):
-            bot.copy_message(chat_id=canal_id, from_chat_id=data["origin_chat_id"],
-                            message_id=data["origin_msg_id"])
+
+        # FOTO CON TRADUCCIÓN EN CAPTION
+        if usar_traduccion and data["tipo"] == "foto":
+            caption = construir_mensaje_trilingue(data["contenido"]) if data.get("contenido") else ""
+            bot.send_photo(canal_id, data["file_id"], caption=caption)
             return
+
+        # VIDEO CON TRADUCCIÓN EN CAPTION
+        if usar_traduccion and data["tipo"] == "video":
+            caption = construir_mensaje_trilingue(data["contenido"]) if data.get("contenido") else ""
+            bot.send_video(canal_id, data["file_id"], caption=caption)
+            return
+
+        # COPY_MESSAGE (preserva emojis premium)
+        if data.get("origin_chat_id") and data.get("origin_msg_id"):
+            bot.copy_message(
+                chat_id=canal_id,
+                from_chat_id=data["origin_chat_id"],
+                message_id=data["origin_msg_id"]
+            )
+            return
+
+        # ENVÍO NORMAL
         if data["tipo"] == "texto":
             bot.send_message(canal_id, data["contenido"], parse_mode="HTML")
         elif data["tipo"] == "foto":
-            bot.send_photo(canal_id, data["file_id"], caption=data["contenido"], parse_mode="HTML")
+            bot.send_photo(canal_id, data["file_id"],
+                          caption=data.get("contenido", ""), parse_mode="HTML")
         elif data["tipo"] == "video":
-            bot.send_video(canal_id, data["file_id"], caption=data["contenido"], parse_mode="HTML")
+            bot.send_video(canal_id, data["file_id"],
+                          caption=data.get("contenido", ""), parse_mode="HTML")
     except Exception as e:
         log_error(e)
         print(f"❌ Error enviando a {canal_id}: {e}", flush=True)
@@ -567,17 +618,45 @@ def vista_previa(update, context):
     traducir_msg = context.user_data.get("traducir", False)
     rec_txt = f"\n🔁 Recurrencia: {recurrente}" if recurrente else ""
     trad_txt = "\n🌐 Se enviará en ES / EN / IT" if traducir_msg else ""
+    tipo = data_msg.get("tipo", "")
+    n_fotos = f"\n📸 Álbum de {len(data_msg.get('file_ids', []))} fotos" if tipo == "album" else ""
     texto = (
         f"👁 *Vista previa*\n\n"
-        f"📢 Canal: {canal}\n📅 Fecha: {fecha}{rec_txt}{trad_txt}\n"
-        f"📝 Tipo: {data_msg['tipo']}\n\n"
-        f"*Contenido:*\n{data_msg['contenido'] or '_(archivo multimedia)_'}"
+        f"📢 Canal: {canal}\n📅 Fecha: {fecha}{rec_txt}{trad_txt}{n_fotos}\n"
+        f"📝 Tipo: {tipo}\n\n"
+        f"*Contenido:*\n{data_msg.get('contenido') or '_(archivo multimedia)_'}"
     )
     kb = [
         [InlineKeyboardButton("✅ Confirmar y programar", callback_data="confirmar_envio")],
         [InlineKeyboardButton("❌ Cancelar", callback_data="main_menu")]
     ]
     q.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+# ===== PROCESAR ÁLBUM =====
+def procesar_album(context):
+    user_id = context.job.context["user_id"]
+    update = context.job.context["update"]
+    ctx = context.job.context["ctx"]
+    if user_id not in ALBUMS:
+        return
+    album_data = ALBUMS.pop(user_id)
+    fotos = album_data.get("fotos", [])
+    caption = album_data.get("caption", "")
+    if not fotos:
+        return
+    ctx.user_data["data"] = {
+        "tipo": "album",
+        "contenido": caption,
+        "file_id": fotos[0],
+        "file_ids": fotos,
+        "origin_chat_id": None,
+        "origin_msg_id": None
+    }
+    update.message.reply_text(
+        f"📸 Álbum de *{len(fotos)} fotos* recibido. Ahora selecciona el día:",
+        parse_mode="Markdown"
+    )
+    calendario(update, ctx)
 
 # ===== MANEJADOR CENTRAL DE BOTONES =====
 def botones(update, context):
@@ -607,7 +686,10 @@ def botones(update, context):
 
     elif data.startswith("canal_"):
         context.user_data["canal"] = data.replace("canal_", "", 1)
-        q.message.reply_text("📨 Envíame el contenido\n_(texto, foto o video)_", parse_mode="Markdown")
+        q.message.reply_text(
+            "📨 Envíame el contenido\n_(texto, foto, video o varias fotos para álbum)_",
+            parse_mode="Markdown"
+        )
 
     elif data.startswith("fecha_"):
         mostrar_horas(update, context)
@@ -635,7 +717,8 @@ def botones(update, context):
     elif data.startswith("rec_"):
         context.user_data["recurrente"] = None if data == "rec_none" else data.replace("rec_", "")
         data_msg = context.user_data.get("data", {})
-        if data_msg.get("tipo") == "texto":
+        tipo = data_msg.get("tipo", "")
+        if tipo in ("texto", "foto", "video", "album"):
             kb = [
                 [InlineKeyboardButton("🌐 Sí, traducir (ES / EN / IT)", callback_data="trad_si")],
                 [InlineKeyboardButton("❌ No, solo español", callback_data="trad_no")]
@@ -672,14 +755,18 @@ def botones(update, context):
             q.message.reply_text("❌ La fecha ya pasó.")
             return
         id_msg = guardar(
-            data_msg["tipo"], data_msg["contenido"], data_msg["file_id"],
+            data_msg["tipo"], data_msg.get("contenido", ""), data_msg.get("file_id"),
             fecha_final, canal, recurrente,
-            data_msg.get("origin_chat_id"), data_msg.get("origin_msg_id"), traducir_msg
+            data_msg.get("origin_chat_id"), data_msg.get("origin_msg_id"),
+            traducir_msg, data_msg.get("file_ids")
         )
         context.job_queue.run_once(
             enviar, when=delay,
-            context={**data_msg, "canal": canal, "id": id_msg,
-                     "recurrente": recurrente, "fecha_str": fecha_final, "traducir": traducir_msg}
+            context={
+                **data_msg, "canal": canal, "id": id_msg,
+                "recurrente": recurrente, "fecha_str": fecha_final,
+                "traducir": traducir_msg
+            }
         )
         rec_txt = f" | 🔁 {recurrente}" if recurrente else ""
         trad_txt = " | 🌐 Trilingüe" if traducir_msg else ""
@@ -712,7 +799,8 @@ def botones(update, context):
             InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"eliminar_{id_msg}"),
             InlineKeyboardButton("❌ Cancelar", callback_data="panel_menu")
         ]]
-        q.message.reply_text("⚠️ ¿Seguro?", reply_markup=InlineKeyboardMarkup(kb))
+        q.message.reply_text("⚠️ ¿Seguro que quieres eliminar este mensaje?",
+                             reply_markup=InlineKeyboardMarkup(kb))
     elif data.startswith("eliminar_"):
         eliminar(int(data.split("_")[1]))
         q.message.reply_text("🗑 Eliminado correctamente.")
@@ -758,10 +846,11 @@ def recibir(update, context):
     if not update.message:
         return
     msg = update.message
+    user_id = update.effective_user.id
 
     if "editando_id" in context.user_data:
         if msg.text and not msg.text.startswith("/"):
-            id_msg = context.user_data.pop("editando_id")
+            context.user_data.pop("editando_id")
             context.user_data["editando_contenido"] = msg.text_html
             msg.reply_text("📅 Selecciona la nueva fecha:")
             calendario(update, context)
@@ -770,23 +859,46 @@ def recibir(update, context):
     if "canal" not in context.user_data:
         return
 
-    if msg.text and not msg.text.startswith("/"):
-        context.user_data["data"] = {
-            "tipo": "texto", "contenido": msg.text,
-            "file_id": None, "origin_chat_id": msg.chat_id, "origin_msg_id": msg.message_id
-        }
-        calendario(update, context)
-    elif msg.photo:
+    # ÁLBUM — múltiples fotos enviadas juntas
+    if msg.photo and msg.media_group_id:
+        if user_id not in ALBUMS:
+            ALBUMS[user_id] = {"fotos": [], "caption": ""}
+        ALBUMS[user_id]["fotos"].append(msg.photo[-1].file_id)
+        if msg.caption_html:
+            ALBUMS[user_id]["caption"] = msg.caption_html
+        for job in context.job_queue.get_jobs_by_name(f"album_{user_id}"):
+            job.schedule_removal()
+        context.job_queue.run_once(
+            procesar_album,
+            when=2,
+            context={"user_id": user_id, "update": update, "ctx": context},
+            name=f"album_{user_id}"
+        )
+        return
+
+    # FOTO SOLA
+    if msg.photo and not msg.media_group_id:
         context.user_data["data"] = {
             "tipo": "foto", "contenido": msg.caption_html or "",
             "file_id": msg.photo[-1].file_id,
             "origin_chat_id": msg.chat_id, "origin_msg_id": msg.message_id
         }
         calendario(update, context)
+
+    # VIDEO
     elif msg.video:
         context.user_data["data"] = {
             "tipo": "video", "contenido": msg.caption_html or "",
             "file_id": msg.video.file_id,
+            "origin_chat_id": msg.chat_id, "origin_msg_id": msg.message_id
+        }
+        calendario(update, context)
+
+    # TEXTO
+    elif msg.text and not msg.text.startswith("/"):
+        context.user_data["data"] = {
+            "tipo": "texto", "contenido": msg.text,
+            "file_id": None,
             "origin_chat_id": msg.chat_id, "origin_msg_id": msg.message_id
         }
         calendario(update, context)
@@ -801,8 +913,11 @@ def cmd_pendientes(update, context):
         return
     texto = f"⏳ *{len(datos)} pendientes:*\n\n"
     for m in datos[:10]:
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg = m
-        texto += f"• ID {id} | {canal} | {fecha}{'🔁' if recurrente else ''}{'🌐' if traducir_msg else ''}\n"
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str = m
+        rec = " 🔁" if recurrente else ""
+        trad = " 🌐" if traducir_msg else ""
+        album = f" 📸{len(file_ids_str.split(','))}" if file_ids_str and tipo == "album" else ""
+        texto += f"• ID {id} | {canal} | {fecha}{rec}{trad}{album}\n"
     update.message.reply_text(texto, parse_mode="Markdown")
 
 def cmd_errores(update, context):
