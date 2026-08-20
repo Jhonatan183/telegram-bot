@@ -892,8 +892,31 @@ def botones(update, context):
         context.user_data["accion_tematica"] = "nueva"
         q.message.reply_text("➕ Envía el nombre de la nueva temática:")
     elif data.startswith("tema_add_"):
-        context.user_data["accion_canal"] = ("nuevo", int(data.rsplit("_", 1)[1]))
-        q.message.reply_text("➕ Envía `Nombre del canal | -100xxxxxxxxxx`", parse_mode="Markdown")
+        context.user_data["esperando_canal_reenviado"] = int(data.rsplit("_", 1)[1])
+        q.message.reply_text(
+            "➕ Reenvía una publicación del canal que quieres agregar.\n\n"
+            "El bot detectará automáticamente el nombre y el ID. "
+            "También puedes escribir `Nombre del canal | -100xxxxxxxxxx`.",
+            parse_mode="Markdown"
+        )
+    elif data.startswith("confirmarautocanal_"):
+        _, tema_id, canal_id = data.split("_", 2)
+        pendiente = context.user_data.pop("canal_detectado", None)
+        if not pendiente or pendiente["tema_id"] != int(tema_id) or pendiente["canal_id"] != int(canal_id):
+            q.message.reply_text("❌ La confirmación venció. Intenta agregar el canal otra vez.")
+            return
+        try:
+            safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s,%s,%s)",
+                         (pendiente["nombre"], pendiente["canal_id"], pendiente["tema_id"]))
+            conn.commit()
+            q.message.reply_text(f"✅ Canal *{pendiente['nombre']}* agregado.", parse_mode="Markdown")
+        except Exception as e:
+            conn.rollback()
+            log_error(e)
+            q.message.reply_text("❌ Ese canal o nombre ya está registrado.")
+    elif data == "cancelarautocanal":
+        context.user_data.pop("canal_detectado", None)
+        q.message.reply_text("Operación cancelada.")
     elif data.startswith("tema_edit_"):
         context.user_data["accion_tematica"] = ("editar", int(data.rsplit("_", 1)[1]))
         q.message.reply_text("✏️ Envía el nuevo nombre de la temática:")
@@ -976,6 +999,39 @@ def recibir(update, context):
         return
     msg = update.message
     user_id = update.effective_user.id
+
+    if "esperando_canal_reenviado" in context.user_data:
+        tema_id = context.user_data["esperando_canal_reenviado"]
+        canal_origen = getattr(msg, "forward_from_chat", None)
+        if canal_origen and canal_origen.type == "channel":
+            context.user_data.pop("esperando_canal_reenviado")
+            pendiente = {"tema_id": tema_id, "nombre": canal_origen.title, "canal_id": canal_origen.id}
+            context.user_data["canal_detectado"] = pendiente
+            kb = [[
+                InlineKeyboardButton("✅ Agregar", callback_data=f"confirmarautocanal_{tema_id}_{canal_origen.id}"),
+                InlineKeyboardButton("❌ Cancelar", callback_data="cancelarautocanal")
+            ]]
+            msg.reply_text(
+                f"📢 Canal detectado: *{canal_origen.title}*\n📁 Temática seleccionada\n\n¿Deseas agregarlo?",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return
+        if msg.text and "|" in msg.text:
+            try:
+                nombre, canal_id_txt = [parte.strip() for parte in msg.text.split("|", 1)]
+                canal_id = int(canal_id_txt)
+                safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s,%s,%s)",
+                             (nombre, canal_id, tema_id))
+                conn.commit()
+                context.user_data.pop("esperando_canal_reenviado")
+                msg.reply_text("✅ Canal agregado.")
+            except Exception as e:
+                conn.rollback()
+                log_error(e)
+                msg.reply_text("❌ Formato inválido, nombre/ID duplicado o error al guardar.")
+            return
+        msg.reply_text("❌ Reenvía una publicación de un canal o usa `Nombre | -100xxxxxxxxxx`.", parse_mode="Markdown")
+        return
 
     if msg.text and "accion_tematica" in context.user_data:
         accion = context.user_data.pop("accion_tematica")
