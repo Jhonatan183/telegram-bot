@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import requests
 import psycopg2
 from psycopg2 import OperationalError
@@ -89,6 +90,7 @@ cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS origin_chat_id BIG
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS origin_msg_id BIGINT DEFAULT NULL")
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS traducir BOOLEAN DEFAULT FALSE")
 cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS file_ids TEXT DEFAULT NULL")
+cursor.execute("ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS destinatarios TEXT DEFAULT NULL")
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS canales (
@@ -97,6 +99,19 @@ cursor.execute("""
         canal_id BIGINT UNIQUE
     )
 """)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tematicas (
+        id SERIAL PRIMARY KEY,
+        nombre TEXT NOT NULL UNIQUE
+    )
+""")
+cursor.execute("ALTER TABLE canales ADD COLUMN IF NOT EXISTS tematica_id INTEGER")
+cursor.execute("ALTER TABLE canales DROP CONSTRAINT IF EXISTS canales_tematica_id_fkey")
+cursor.execute("""ALTER TABLE canales ADD CONSTRAINT canales_tematica_id_fkey
+                FOREIGN KEY (tematica_id) REFERENCES tematicas(id) ON DELETE SET NULL""")
+cursor.execute("INSERT INTO tematicas (nombre) VALUES ('General') ON CONFLICT (nombre) DO NOTHING")
+cursor.execute("""UPDATE canales SET tematica_id = (SELECT id FROM tematicas WHERE nombre = 'General')
+                WHERE tematica_id IS NULL""")
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS errores (
         id SERIAL PRIMARY KEY,
@@ -144,17 +159,38 @@ def get_canales():
     safe_execute("SELECT nombre, canal_id FROM canales ORDER BY nombre")
     return {row[0]: row[1] for row in cursor.fetchall()}
 
+def get_tematicas():
+    safe_execute("SELECT id, nombre FROM tematicas ORDER BY nombre")
+    return cursor.fetchall()
+
+def get_canales_tematica(tematica_id):
+    safe_execute("SELECT nombre, canal_id FROM canales WHERE tematica_id=%s ORDER BY nombre", (tematica_id,))
+    return cursor.fetchall()
+
+def get_destinatarios(canal, destinatarios=None):
+    """Resuelve sólo los destinatarios congelados de un mensaje nuevo.
+    Los mensajes antiguos sin instantánea conservan su comportamiento previo.
+    """
+    if destinatarios:
+        return [int(cid) for cid in destinatarios]
+    canales = get_canales()
+    if canal == "ALL":
+        return list(canales.values())
+    return [canales[canal]] if canal in canales else []
+
 # ===== FUNCIONES MENSAJES =====
 def guardar(tipo, contenido, file_id, fecha, canal, recurrente=None,
-            origin_chat_id=None, origin_msg_id=None, traducir_msg=False, file_ids=None):
+            origin_chat_id=None, origin_msg_id=None, traducir_msg=False, file_ids=None,
+            destinatarios=None):
     file_ids_str = ",".join(file_ids) if file_ids else None
     safe_execute(
         """INSERT INTO mensajes
            (tipo, contenido, file_id, fecha, canal, recurrente,
-            origin_chat_id, origin_msg_id, traducir, file_ids)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            origin_chat_id, origin_msg_id, traducir, file_ids, destinatarios)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (tipo, contenido, file_id, fecha, canal, recurrente,
-         origin_chat_id, origin_msg_id, traducir_msg, file_ids_str)
+         origin_chat_id, origin_msg_id, traducir_msg, file_ids_str,
+         json.dumps(destinatarios) if destinatarios is not None else None)
     )
     id_msg = cursor.fetchone()[0]
     conn.commit()
@@ -169,7 +205,7 @@ def obtener(solo_pendientes=False, solo_enviados=False, solo_recurrentes=False):
     if solo_recurrentes:
         condiciones.append("recurrente IS NOT NULL")
     where = f"WHERE {' AND '.join(condiciones)}" if condiciones else ""
-    safe_execute(f"SELECT * FROM mensajes {where} ORDER BY id DESC")
+    safe_execute(f"SELECT id,tipo,contenido,file_id,fecha,canal,enviado,recurrente,origin_chat_id,origin_msg_id,traducir,file_ids,destinatarios FROM mensajes {where} ORDER BY id DESC")
     return cursor.fetchall()
 
 def eliminar(id):
@@ -272,9 +308,9 @@ def grafico():
 
 # ===== RECUPERAR AL INICIAR =====
 def recuperar(dispatcher):
-    safe_execute("SELECT * FROM mensajes WHERE enviado=FALSE")
+    safe_execute("SELECT id,tipo,contenido,file_id,fecha,canal,enviado,recurrente,origin_chat_id,origin_msg_id,traducir,file_ids,destinatarios FROM mensajes WHERE enviado=FALSE")
     for m in cursor.fetchall():
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, origin_chat_id, origin_msg_id, traducir_msg, file_ids_str = m
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, origin_chat_id, origin_msg_id, traducir_msg, file_ids_str, destinatarios_str = m
         try:
             fecha_dt = TIMEZONE.localize(datetime.strptime(fecha, "%Y-%m-%d %H:%M"))
         except Exception:
@@ -290,7 +326,8 @@ def recuperar(dispatcher):
                 "file_id": file_id, "file_ids": file_ids,
                 "canal": canal, "recurrente": recurrente,
                 "fecha_str": fecha, "origin_chat_id": origin_chat_id,
-                "origin_msg_id": origin_msg_id, "traducir": traducir_msg
+                "origin_msg_id": origin_msg_id, "traducir": traducir_msg,
+                "destinatarios": json.loads(destinatarios_str) if destinatarios_str else None
             }
         )
 
@@ -401,7 +438,7 @@ def panel(update, context, filtro="todos"):
         parse_mode="Markdown"
     )
     for m in pagina:
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str = m
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str, _ = m
         estado = "✅ Enviado" if enviado else "⏳ Pendiente"
         rec = f" | 🔁 {recurrente}" if recurrente else ""
         trad = " | 🌐" if traducir_msg else ""
@@ -433,12 +470,12 @@ def panel(update, context, filtro="todos"):
 def ver_detalle(update, context, id_msg):
     q = update.callback_query
     q.answer()
-    safe_execute("SELECT * FROM mensajes WHERE id=%s", (id_msg,))
+    safe_execute("SELECT id,tipo,contenido,file_id,fecha,canal,enviado,recurrente,origin_chat_id,origin_msg_id,traducir,file_ids,destinatarios FROM mensajes WHERE id=%s", (id_msg,))
     m = cursor.fetchone()
     if not m:
         q.message.reply_text("❌ Mensaje no encontrado.")
         return
-    id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str = m
+    id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str, _ = m
     estado = "✅ Enviado" if enviado else "⏳ Pendiente"
     n_fotos = f"\n<b>Fotos en álbum:</b> {len(file_ids_str.split(','))}" if file_ids_str and tipo == "album" else ""
     texto = (
@@ -463,13 +500,33 @@ def ver_detalle(update, context, id_msg):
 def menu_canales(update, context):
     q = update.callback_query
     q.answer()
-    canales = get_canales()
-    texto = "📢 *Canales registrados:*\n\n"
-    texto += "".join([f"• *{n}*: `{c}`\n" for n, c in canales.items()]) if canales else "_Sin canales_\n"
+    temas = get_tematicas()
+    texto = "📁 *Temáticas*\n\nSelecciona una temática para administrar sus canales."
     kb = [
-        [InlineKeyboardButton("➕ Agregar canal", callback_data="add_canal")],
-        [InlineKeyboardButton("🗑 Eliminar canal", callback_data="del_canal_menu")],
+        [InlineKeyboardButton(nombre, callback_data=f"tema_{tema_id}")] for tema_id, nombre in temas
+    ] + [
+        [InlineKeyboardButton("➕ Nueva temática", callback_data="tema_nueva")],
         [InlineKeyboardButton("🔙 Menú principal", callback_data="main_menu")]
+    ]
+    q.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+def ver_tematica(update, context, tema_id):
+    q = update.callback_query
+    safe_execute("SELECT nombre FROM tematicas WHERE id=%s", (tema_id,))
+    fila = cursor.fetchone()
+    if not fila:
+        q.message.reply_text("❌ Temática no encontrada.")
+        return
+    canales = get_canales_tematica(tema_id)
+    texto = f"📁 *{fila[0]}*\n\n" + ("".join(f"📢 *{n}*: `{cid}`\n" for n, cid in canales) if canales else "_Sin canales_")
+    kb = [
+        [InlineKeyboardButton("➕ Agregar canal", callback_data=f"tema_add_{tema_id}")],
+        [InlineKeyboardButton("✏️ Editar temática", callback_data=f"tema_edit_{tema_id}")],
+        [InlineKeyboardButton("🗑 Eliminar temática", callback_data=f"tema_del_{tema_id}")],
+        [InlineKeyboardButton("✏️ Editar canal", callback_data=f"tema_editcanal_{tema_id}")],
+        [InlineKeyboardButton("🗑 Eliminar canal", callback_data=f"tema_delcanal_{tema_id}")],
+        [InlineKeyboardButton("🔄 Mover canal", callback_data=f"tema_move_{tema_id}")],
+        [InlineKeyboardButton("⬅️ Volver", callback_data="menu_canales")]
     ]
     q.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -488,7 +545,7 @@ def hacer_addcanal(update, context):
         update.message.reply_text("❌ El ID debe ser número.", parse_mode="Markdown")
         return
     try:
-        safe_execute("INSERT INTO canales (nombre, canal_id) VALUES (%s, %s)", (nombre, canal_id))
+        safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s, %s, (SELECT id FROM tematicas WHERE nombre='General'))", (nombre, canal_id))
         conn.commit()
         update.message.reply_text(f"✅ Canal *{nombre}* agregado.", parse_mode="Markdown")
     except Exception:
@@ -519,13 +576,10 @@ def cmd_delcanal(update, context):
 def enviar(context):
     data = context.job.context
     bot = context.bot
-    canales = get_canales()
     try:
-        if data["canal"] == "ALL":
-            for canal_id in canales.values():
-                enviar_tipo(bot, canal_id, data)
-        elif data["canal"] in canales:
-            enviar_tipo(bot, canales[data["canal"]], data)
+        # Para las nuevas programaciones se usa una instantánea; nunca la lista global.
+        for canal_id in get_destinatarios(data["canal"], data.get("destinatarios")):
+            enviar_tipo(bot, canal_id, data)
         safe_execute("UPDATE mensajes SET enviado=TRUE WHERE id=%s", (data["id"],))
         conn.commit()
         if data.get("recurrente"):
@@ -537,7 +591,7 @@ def enviar(context):
                 data["tipo"], data["contenido"], data["file_id"],
                 nueva_fecha_str, data["canal"], recurrente,
                 data.get("origin_chat_id"), data.get("origin_msg_id"),
-                data.get("traducir", False), data.get("file_ids")
+                data.get("traducir", False), data.get("file_ids"), data.get("destinatarios")
             )
             delay = (TIMEZONE.localize(nueva_fecha) - datetime.now(TIMEZONE)).total_seconds()
             if delay > 0:
@@ -678,11 +732,28 @@ def botones(update, context):
                              parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == "prog":
-        canales = get_canales()
-        kb = [[InlineKeyboardButton(c, callback_data=f"canal_{c}")] for c in canales]
-        kb.append([InlineKeyboardButton("🔥 TODOS LOS CANALES", callback_data="canal_ALL")])
+        temas = get_tematicas()
+        kb = [[InlineKeyboardButton(nombre, callback_data=f"enviar_tema_{tema_id}")] for tema_id, nombre in temas]
         kb.append([InlineKeyboardButton("🔙 Menú principal", callback_data="main_menu")])
-        q.message.reply_text("📢 Selecciona el canal:", reply_markup=InlineKeyboardMarkup(kb))
+        q.message.reply_text("📁 Selecciona la temática:", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith("enviar_tema_"):
+        tema_id = int(data.rsplit("_", 1)[1])
+        safe_execute("SELECT nombre FROM tematicas WHERE id=%s", (tema_id,))
+        tema = cursor.fetchone()
+        canales = get_canales_tematica(tema_id)
+        if not tema or not canales:
+            q.message.reply_text("❌ Esta temática no tiene canales. Agrega uno primero.")
+            return
+        context.user_data["canal"] = "TEMATICA"
+        context.user_data["tematica_id"] = tema_id
+        context.user_data["destinatarios"] = [cid for _, cid in canales]
+        q.message.reply_text(
+            f"📁 Temática: *{tema[0]}*\n\n📢 Canales asociados:\n" +
+            "\n".join(f"☑ {nombre}" for nombre, _ in canales) +
+            "\n\n📨 Envíame el contenido\n_(texto, foto, video o varias fotos para álbum)_",
+            parse_mode="Markdown"
+        )
 
     elif data.startswith("canal_"):
         context.user_data["canal"] = data.replace("canal_", "", 1)
@@ -758,14 +829,15 @@ def botones(update, context):
             data_msg["tipo"], data_msg.get("contenido", ""), data_msg.get("file_id"),
             fecha_final, canal, recurrente,
             data_msg.get("origin_chat_id"), data_msg.get("origin_msg_id"),
-            traducir_msg, data_msg.get("file_ids")
+            traducir_msg, data_msg.get("file_ids"), context.user_data.get("destinatarios")
         )
         context.job_queue.run_once(
             enviar, when=delay,
             context={
                 **data_msg, "canal": canal, "id": id_msg,
                 "recurrente": recurrente, "fecha_str": fecha_final,
-                "traducir": traducir_msg
+                "traducir": traducir_msg,
+                "destinatarios": context.user_data.get("destinatarios")
             }
         )
         rec_txt = f" | 🔁 {recurrente}" if recurrente else ""
@@ -814,6 +886,63 @@ def botones(update, context):
             q.message.reply_photo(open(ruta, "rb"))
     elif data == "menu_canales":
         menu_canales(update, context)
+    elif data.startswith("tema_") and len(data.split("_")) == 2 and data.rsplit("_", 1)[1].isdigit():
+        ver_tematica(update, context, int(data.rsplit("_", 1)[1]))
+    elif data == "tema_nueva":
+        context.user_data["accion_tematica"] = "nueva"
+        q.message.reply_text("➕ Envía el nombre de la nueva temática:")
+    elif data.startswith("tema_add_"):
+        context.user_data["accion_canal"] = ("nuevo", int(data.rsplit("_", 1)[1]))
+        q.message.reply_text("➕ Envía `Nombre del canal | -100xxxxxxxxxx`", parse_mode="Markdown")
+    elif data.startswith("tema_edit_"):
+        context.user_data["accion_tematica"] = ("editar", int(data.rsplit("_", 1)[1]))
+        q.message.reply_text("✏️ Envía el nuevo nombre de la temática:")
+    elif data.startswith("tema_del_"):
+        tema_id = int(data.rsplit("_", 1)[1])
+        kb = [[InlineKeyboardButton("✅ Confirmar", callback_data=f"tema_confirmdel_{tema_id}"), InlineKeyboardButton("❌ Cancelar", callback_data="menu_canales")]]
+        q.message.reply_text("⚠️ La temática se eliminará y sus canales pasarán a General. ¿Continuar?", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("tema_confirmdel_"):
+        tema_id = int(data.rsplit("_", 1)[1])
+        safe_execute("SELECT id FROM tematicas WHERE nombre='General'")
+        general_id = cursor.fetchone()[0]
+        if tema_id == general_id:
+            q.message.reply_text("❌ La temática General conserva los canales existentes y no se puede eliminar.")
+            return
+        safe_execute("UPDATE canales SET tematica_id=%s WHERE tematica_id=%s", (general_id, tema_id))
+        safe_execute("DELETE FROM tematicas WHERE id=%s AND nombre <> 'General'", (tema_id,))
+        conn.commit()
+        q.message.reply_text("🗑 Temática eliminada; los canales quedaron en General.")
+    elif data.startswith("tema_delcanal_") or data.startswith("tema_editcanal_") or data.startswith("tema_move_"):
+        accion, tema_id = data.split("_")[1], int(data.rsplit("_", 1)[1])
+        canales = get_canales_tematica(tema_id)
+        if not canales:
+            q.message.reply_text("📭 No hay canales en esta temática.")
+            return
+        prefijo = {"delcanal": "borrarcanal", "editcanal": "editarcanal", "move": "movercanal"}[accion]
+        kb = [[InlineKeyboardButton(nombre, callback_data=f"{prefijo}_{cid}_{tema_id}")] for nombre, cid in canales]
+        q.message.reply_text("Selecciona el canal:", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("borrarcanal_"):
+        _, canal_id, tema_id = data.split("_")
+        kb = [[InlineKeyboardButton("✅ Confirmar", callback_data=f"confirmarborrar_{canal_id}"), InlineKeyboardButton("❌ Cancelar", callback_data=f"tema_{tema_id}")]]
+        q.message.reply_text("⚠️ ¿Seguro que quieres eliminar este canal? Sólo se desvinculará del bot.", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("confirmarborrar_"):
+        safe_execute("DELETE FROM canales WHERE canal_id=%s", (int(data.rsplit("_", 1)[1]),))
+        conn.commit()
+        q.message.reply_text("🗑 Canal desvinculado correctamente.")
+    elif data.startswith("editarcanal_"):
+        _, canal_id, tema_id = data.split("_")
+        context.user_data["accion_canal"] = ("editar", int(canal_id), int(tema_id))
+        q.message.reply_text("✏️ Envía `Nuevo nombre | -100xxxxxxxxxx`", parse_mode="Markdown")
+    elif data.startswith("movercanal_"):
+        _, canal_id, tema_id = data.split("_")
+        destinos = [(tid, nombre) for tid, nombre in get_tematicas() if tid != int(tema_id)]
+        kb = [[InlineKeyboardButton(nombre, callback_data=f"confirmarmover_{canal_id}_{tid}")] for tid, nombre in destinos]
+        q.message.reply_text("🔄 Mover a:", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("confirmarmover_"):
+        _, canal_id, destino_id = data.split("_")
+        safe_execute("UPDATE canales SET tematica_id=%s WHERE canal_id=%s", (int(destino_id), int(canal_id)))
+        conn.commit()
+        q.message.reply_text("✅ Canal movido correctamente.")
     elif data == "add_canal":
         q.message.reply_text(
             "➕ Usa:\n`/addcanal NombreCanal -100xxxxxxxxxx`", parse_mode="Markdown")
@@ -847,6 +976,43 @@ def recibir(update, context):
         return
     msg = update.message
     user_id = update.effective_user.id
+
+    if msg.text and "accion_tematica" in context.user_data:
+        accion = context.user_data.pop("accion_tematica")
+        nombre = msg.text.strip()
+        try:
+            if not nombre:
+                raise ValueError("El nombre no puede estar vacío.")
+            if accion == "nueva":
+                safe_execute("INSERT INTO tematicas (nombre) VALUES (%s)", (nombre,))
+            else:
+                _, tema_id = accion
+                safe_execute("UPDATE tematicas SET nombre=%s WHERE id=%s", (nombre, tema_id))
+            conn.commit()
+            msg.reply_text("✅ Temática guardada.")
+        except Exception as e:
+            conn.rollback()
+            log_error(e)
+            msg.reply_text("❌ No se pudo guardar. El nombre puede estar duplicado.")
+        return
+
+    if msg.text and "accion_canal" in context.user_data:
+        accion = context.user_data.pop("accion_canal")
+        try:
+            nombre, canal_id_txt = [parte.strip() for parte in msg.text.split("|", 1)]
+            canal_id = int(canal_id_txt)
+            if accion[0] == "nuevo":
+                safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s,%s,%s)", (nombre, canal_id, accion[1]))
+            else:
+                _, anterior_id, _ = accion
+                safe_execute("UPDATE canales SET nombre=%s, canal_id=%s WHERE canal_id=%s", (nombre, canal_id, anterior_id))
+            conn.commit()
+            msg.reply_text("✅ Canal guardado.")
+        except Exception as e:
+            conn.rollback()
+            log_error(e)
+            msg.reply_text("❌ Formato inválido, nombre/ID duplicado o error al guardar.")
+        return
 
     if "editando_id" in context.user_data:
         if msg.text and not msg.text.startswith("/"):
@@ -913,7 +1079,7 @@ def cmd_pendientes(update, context):
         return
     texto = f"⏳ *{len(datos)} pendientes:*\n\n"
     for m in datos[:10]:
-        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str = m
+        id, tipo, contenido, file_id, fecha, canal, enviado, recurrente, _, _, traducir_msg, file_ids_str, _ = m
         rec = " 🔁" if recurrente else ""
         trad = " 🌐" if traducir_msg else ""
         album = f" 📸{len(file_ids_str.split(','))}" if file_ids_str and tipo == "album" else ""
