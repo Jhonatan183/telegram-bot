@@ -113,6 +113,17 @@ cursor.execute("INSERT INTO tematicas (nombre) VALUES ('General') ON CONFLICT (n
 cursor.execute("""UPDATE canales SET tematica_id = (SELECT id FROM tematicas WHERE nombre = 'General')
                 WHERE tematica_id IS NULL""")
 cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tematica_canales (
+        tematica_id INTEGER NOT NULL REFERENCES tematicas(id) ON DELETE CASCADE,
+        canal_id BIGINT NOT NULL REFERENCES canales(canal_id) ON DELETE CASCADE,
+        PRIMARY KEY (tematica_id, canal_id)
+    )
+""")
+# Migra la pertenencia única anterior sin borrar ni mover ningún canal.
+cursor.execute("""INSERT INTO tematica_canales (tematica_id, canal_id)
+                  SELECT tematica_id, canal_id FROM canales WHERE tematica_id IS NOT NULL
+                  ON CONFLICT DO NOTHING""")
+cursor.execute("""
     CREATE TABLE IF NOT EXISTS errores (
         id SERIAL PRIMARY KEY,
         fecha TEXT,
@@ -164,8 +175,25 @@ def get_tematicas():
     return cursor.fetchall()
 
 def get_canales_tematica(tematica_id):
-    safe_execute("SELECT nombre, canal_id FROM canales WHERE tematica_id=%s ORDER BY nombre", (tematica_id,))
+    safe_execute("""SELECT c.nombre, c.canal_id FROM canales c
+                    JOIN tematica_canales tc ON tc.canal_id=c.canal_id
+                    WHERE tc.tematica_id=%s ORDER BY c.nombre""", (tematica_id,))
     return cursor.fetchall()
+
+def get_canales_fuera_tematica(tematica_id):
+    safe_execute("""SELECT c.nombre, c.canal_id FROM canales c
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM tematica_canales tc
+                        WHERE tc.tematica_id=%s AND tc.canal_id=c.canal_id
+                    ) ORDER BY c.nombre""", (tematica_id,))
+    return cursor.fetchall()
+
+def agregar_canal_a_tematica(nombre, canal_id, tematica_id):
+    """Registra el canal una vez y lo asocia a una o más temáticas."""
+    safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s,%s,%s) ON CONFLICT (canal_id) DO NOTHING",
+                 (nombre, canal_id, tematica_id))
+    safe_execute("INSERT INTO tematica_canales (tematica_id, canal_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                 (tematica_id, canal_id))
 
 def get_destinatarios(canal, destinatarios=None):
     """Resuelve sólo los destinatarios congelados de un mensaje nuevo.
@@ -545,7 +573,8 @@ def hacer_addcanal(update, context):
         update.message.reply_text("❌ El ID debe ser número.", parse_mode="Markdown")
         return
     try:
-        safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s, %s, (SELECT id FROM tematicas WHERE nombre='General'))", (nombre, canal_id))
+        safe_execute("SELECT id FROM tematicas WHERE nombre='General'")
+        agregar_canal_a_tematica(nombre, canal_id, cursor.fetchone()[0])
         conn.commit()
         update.message.reply_text(f"✅ Canal *{nombre}* agregado.", parse_mode="Markdown")
     except Exception:
@@ -892,6 +921,39 @@ def botones(update, context):
         context.user_data["accion_tematica"] = "nueva"
         q.message.reply_text("➕ Envía el nombre de la nueva temática:")
     elif data.startswith("tema_add_"):
+        tema_id = int(data.rsplit("_", 1)[1])
+        kb = [
+            [InlineKeyboardButton("📋 Seleccionar canal existente", callback_data=f"tema_selectexist_{tema_id}")],
+            [InlineKeyboardButton("📨 Reenviar canal nuevo", callback_data=f"tema_addnew_{tema_id}")],
+            [InlineKeyboardButton("⬅️ Volver", callback_data=f"tema_{tema_id}")]
+        ]
+        q.message.reply_text("➕ ¿Cómo quieres agregar el canal?", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("tema_selectexist_"):
+        tema_id = int(data.rsplit("_", 1)[1])
+        canales = get_canales_fuera_tematica(tema_id)
+        if not canales:
+            q.message.reply_text("✅ Todos los canales registrados ya pertenecen a esta temática.")
+            return
+        kb = [[InlineKeyboardButton(f"📢 {nombre}", callback_data=f"addexistente_{tema_id}_{canal_id}")]
+              for nombre, canal_id in canales]
+        kb.append([InlineKeyboardButton("⬅️ Volver", callback_data=f"tema_{tema_id}")])
+        q.message.reply_text("📋 Selecciona el canal que deseas asociar:", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("addexistente_"):
+        _, tema_id, canal_id = data.split("_", 2)
+        try:
+            safe_execute("SELECT nombre FROM canales WHERE canal_id=%s", (int(canal_id),))
+            fila = cursor.fetchone()
+            if not fila:
+                q.message.reply_text("❌ Canal no encontrado.")
+                return
+            agregar_canal_a_tematica(fila[0], int(canal_id), int(tema_id))
+            conn.commit()
+            q.message.reply_text(f"✅ Canal *{fila[0]}* agregado a la temática.", parse_mode="Markdown")
+        except Exception as e:
+            conn.rollback()
+            log_error(e)
+            q.message.reply_text("❌ No se pudo agregar el canal.")
+    elif data.startswith("tema_addnew_"):
         context.user_data["esperando_canal_reenviado"] = int(data.rsplit("_", 1)[1])
         q.message.reply_text(
             "➕ Reenvía una publicación del canal que quieres agregar.\n\n"
@@ -906,8 +968,7 @@ def botones(update, context):
             q.message.reply_text("❌ La confirmación venció. Intenta agregar el canal otra vez.")
             return
         try:
-            safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s,%s,%s)",
-                         (pendiente["nombre"], pendiente["canal_id"], pendiente["tema_id"]))
+            agregar_canal_a_tematica(pendiente["nombre"], pendiente["canal_id"], pendiente["tema_id"])
             conn.commit()
             q.message.reply_text(f"✅ Canal *{pendiente['nombre']}* agregado.", parse_mode="Markdown")
         except Exception as e:
@@ -931,7 +992,9 @@ def botones(update, context):
         if tema_id == general_id:
             q.message.reply_text("❌ La temática General conserva los canales existentes y no se puede eliminar.")
             return
-        safe_execute("UPDATE canales SET tematica_id=%s WHERE tematica_id=%s", (general_id, tema_id))
+        safe_execute("""INSERT INTO tematica_canales (tematica_id, canal_id)
+                        SELECT %s, canal_id FROM tematica_canales WHERE tematica_id=%s
+                        ON CONFLICT DO NOTHING""", (general_id, tema_id))
         safe_execute("DELETE FROM tematicas WHERE id=%s AND nombre <> 'General'", (tema_id,))
         conn.commit()
         q.message.reply_text("🗑 Temática eliminada; los canales quedaron en General.")
@@ -959,11 +1022,12 @@ def botones(update, context):
     elif data.startswith("movercanal_"):
         _, canal_id, tema_id = data.split("_")
         destinos = [(tid, nombre) for tid, nombre in get_tematicas() if tid != int(tema_id)]
-        kb = [[InlineKeyboardButton(nombre, callback_data=f"confirmarmover_{canal_id}_{tid}")] for tid, nombre in destinos]
+        kb = [[InlineKeyboardButton(nombre, callback_data=f"confirmarmover_{canal_id}_{tema_id}_{tid}")] for tid, nombre in destinos]
         q.message.reply_text("🔄 Mover a:", reply_markup=InlineKeyboardMarkup(kb))
     elif data.startswith("confirmarmover_"):
-        _, canal_id, destino_id = data.split("_")
-        safe_execute("UPDATE canales SET tematica_id=%s WHERE canal_id=%s", (int(destino_id), int(canal_id)))
+        _, canal_id, tema_id, destino_id = data.split("_")
+        safe_execute("DELETE FROM tematica_canales WHERE tematica_id=%s AND canal_id=%s", (int(tema_id), int(canal_id)))
+        safe_execute("INSERT INTO tematica_canales (tematica_id, canal_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (int(destino_id), int(canal_id)))
         conn.commit()
         q.message.reply_text("✅ Canal movido correctamente.")
     elif data == "add_canal":
@@ -1020,8 +1084,7 @@ def recibir(update, context):
             try:
                 nombre, canal_id_txt = [parte.strip() for parte in msg.text.split("|", 1)]
                 canal_id = int(canal_id_txt)
-                safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s,%s,%s)",
-                             (nombre, canal_id, tema_id))
+                agregar_canal_a_tematica(nombre, canal_id, tema_id)
                 conn.commit()
                 context.user_data.pop("esperando_canal_reenviado")
                 msg.reply_text("✅ Canal agregado.")
@@ -1058,7 +1121,7 @@ def recibir(update, context):
             nombre, canal_id_txt = [parte.strip() for parte in msg.text.split("|", 1)]
             canal_id = int(canal_id_txt)
             if accion[0] == "nuevo":
-                safe_execute("INSERT INTO canales (nombre, canal_id, tematica_id) VALUES (%s,%s,%s)", (nombre, canal_id, accion[1]))
+                agregar_canal_a_tematica(nombre, canal_id, accion[1])
             else:
                 _, anterior_id, _ = accion
                 safe_execute("UPDATE canales SET nombre=%s, canal_id=%s WHERE canal_id=%s", (nombre, canal_id, anterior_id))
